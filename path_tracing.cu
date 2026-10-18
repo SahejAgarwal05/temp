@@ -1,33 +1,10 @@
-// CUDA implementation of the assignment's unchanged render_scene entry point.
-/*
-READING GUIDE
-
-Start at render_scene() at the bottom:
-  1. CPU: flatten the supplied Objects into triangle and material arrays.
-  2. GPU: build_bvh() sorts triangles spatially and builds their bounding tree.
-  3. GPU: paths() distributes samples and calls trace_path() for each sample.
-  4. GPU: closest_hit() searches the tree at each bounce of trace_path().
-  5. GPU: average() combines subpixels into output pixels.
-  6. CPU: copy colors back and apply the supplied to_pixel() conversion.
-
-The CPU packs/uploads scene records and converts the final pixels.
-Triangle bounds, spatial keys, sorting, tree links and tree boxes are built on
-the GPU. This is a Morton-code BVH (LBVH), replacing the earlier CPU SAH builder.
-
-The structs are simple records, not an inheritance hierarchy:
-  Material        = the albedo/emission of one object, read by GPU threads.
-  Primitive       = one triangle, its object number and its original triangle ID.
-  Node            = one BVH box with either child links or a triangle range.
-  Box             = helper for finding/merging minimum and maximum coordinates.
-  DeviceBuffer<T> = CPU owner of an allocated GPU array of T elements.
-  Closest         = one ray's nearest intersection found so far.
-
-CUDA keywords:
-  __device__  : a helper that executes on the GPU.
-  __global__  : a kernel launched with <<<number of blocks, threads per block>>>.
-  __constant__: small GPU memory populated by the CPU, then read by kernels.
-  __host__ __device__: a helper usable on either processor.
-*/
+// CUDA renderer with selectable sampled uniform-grid and exact BVH searches.
+// Host: pack/upload triangles and materials, allocate buffers using GPU counts.
+// Sampled GPU build: subdivide triangle surfaces at spacing <= D, prefix-scan
+// counts, generate samples, count/scan/scatter references into a uniform grid.
+// GPU rendering: paths<true> uses grid DDA; paths<false> uses the original LBVH.
+// Both share material shading, bounce sampling, sample distribution, averaging,
+// tone mapping and gamma conversion. Only final RGB bytes return to the CPU.
 #include "graphics.cuh"
 #include "geometry.cuh"
 
@@ -35,6 +12,10 @@ CUDA keywords:
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
+#include <thrust/scan.h>
+#include <iostream>
+#include <stdexcept>
+#include <string>
 
 namespace {
 constexpr int kStack = 64;
@@ -92,9 +73,19 @@ DeviceBuffer<Node>(100) allocates room for 100 Nodes, not 100 bytes.
   = delete: prevent two copied owners from accidentally freeing the same pointer.
 The owner is on the CPU; its pointed-to array is on the GPU.
 */
+void cuda_check(cudaError_t error) {
+    if (error != cudaSuccess) throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(error));
+}
+
 template<class T> struct DeviceBuffer {
     T* data = nullptr;
-    explicit DeviceBuffer(size_t n) { if (n) cudaMalloc(&data, n * sizeof(T)); }
+    explicit DeviceBuffer(size_t n) { allocate(n); }
+    void allocate(size_t n) {
+        if (data) throw std::runtime_error("Device buffer already allocated");
+        if (n > std::numeric_limits<size_t>::max() / sizeof(T))
+            throw std::runtime_error("Device allocation size overflow");
+        if (n) cuda_check(cudaMalloc(&data, n * sizeof(T)));
+    }
     ~DeviceBuffer() { if (data) cudaFree(data); }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
@@ -344,6 +335,8 @@ __device__ Closest closest_hit(const Ray& ray, const Primitive* triangles, int c
     }
     return hit;
 }
+#include "sampled_grid.cuh"
+
 // Mix neighboring thread indices before seeding the supplied cuRAND wrapper.
 // The shifts/xors/multiplications scramble integer bits. This is a seed mixer;
 // RandomGPU itself is the random-number generator used for hemisphere sampling.
@@ -353,22 +346,41 @@ __device__ uint32_t hash(uint32_t x) {
 
 // Follow one ray through all its bounces. throughput is the accumulated albedo;
 // light is the emission/background weighted by that accumulated color.
+template<bool Sampled>
 __device__ Vec3 trace_path(Ray ray, const RenderSettings& settings,
                           const Primitive* triangles, int count, const Node* nodes,
-                          RandomGPU& random) {
+                          SampleGrid grid, RandomGPU& random) {
     Vec3 throughput(1, 1, 1), light;
     int last = -1;
     // A path starts with all color channels weighted by 1. After surfaces with
     // albedos A and B, later contributions are weighted by A*B component by
     // component. Emission is added at every hit; background is added on a miss.
     for (int depth = 0; ; ++depth) {
-        const Closest hit = closest_hit(ray, triangles, count, nodes, last);
-        if (hit.index < 0) {
-            light += multiply(throughput, settings.background_light);
-            break;
+        HitRecord record;
+        int object, triangle_id;
+        if constexpr (Sampled) {
+            const SampleClosest hit = sampled_hit(ray, grid, last);
+            if (hit.index < 0) {
+                light += multiply(throughput, settings.background_light);
+                break;
+            }
+            const SurfaceSample p = grid.samples[hit.index];
+            record.t = hit.t; record.position = p.position; record.unit_normal = p.normal;
+            object = p.object; triangle_id = p.triangle;
+        } else {
+            const Closest hit = closest_hit(ray, triangles, count, nodes, last);
+            if (hit.index < 0) {
+                light += multiply(throughput, settings.background_light);
+                break;
+            }
+            const Primitive p = triangles[hit.index];
+            record.t = hit.t;
+            record.position = ray.origin + hit.t * ray.direction;
+            record.unit_normal = normalize(cross(p.triangle.p1 - p.triangle.p0,
+                                                 p.triangle.p2 - p.triangle.p0));
+            object = p.object; triangle_id = p.id;
         }
-        const Primitive p = triangles[hit.index];
-        const Material material = materials[p.object];
+        const Material material = materials[object];
         // A hit still emits at the bounce limit; only further scattering stops.
         // depth=0 is the camera ray's first hit. With max_bounces=1, that hit
         // may scatter once; a second hit at depth=1 emits but does not scatter.
@@ -376,18 +388,11 @@ __device__ Vec3 trace_path(Ray ray, const RenderSettings& settings,
         if (depth >= settings.max_bounces) break;
         throughput = multiply(throughput, Vec3(material.albedo.x, material.albedo.y, material.albedo.z));
 
-        // Compute the normal only for the closest triangle and face it toward
-        // the incoming ray, as in the supplied intersection routine.
-        HitRecord record;
-        record.t = hit.t;
-        record.position = ray.origin + hit.t * ray.direction;
-        record.unit_normal = normalize(cross(p.triangle.p1 - p.triangle.p0,
-                                             p.triangle.p2 - p.triangle.p0));
         if (dot(record.unit_normal, ray.direction) > 0) record.unit_normal = -record.unit_normal;
         ray = cosine_weighted_sampling(record, random);
         // The supplied sampler starts exactly at record.position. Remember the
         // original ID so the next search ignores only the triangle just left.
-        last = p.id;
+        last = triangle_id;
     }
     return light;
 }
@@ -395,8 +400,9 @@ __device__ Vec3 trace_path(Ray ray, const RenderSettings& settings,
 // One thread runs its share of a subpixel's complete paths, without recursion.
 // Groups larger than a warp emit one atomic sum per warp. Padded lanes always
 // reach every shuffle, even when there are fewer subpixels than launch threads.
+template<bool Sampled>
 __global__ void paths(RenderSettings settings, const Primitive* triangles, int count,
-                      const Node* nodes, Vec3* sums,
+                      const Node* nodes, SampleGrid grid, Vec3* sums,
                       size_t subpixels, int split) {
     const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     // Consecutive groups of split threads share a subpixel. The power-of-two
@@ -418,7 +424,7 @@ __global__ void paths(RenderSettings settings, const Primitive* triangles, int c
         // Strided ownership visits every sample exactly once, including when
         // samples_per_pixel is not divisible by split. Some threads may do none.
         for (size_t sample = part; sample < size_t(settings.samples_per_pixel); sample += split)
-            sum += trace_path(primary, settings, triangles, count, nodes, random);
+            sum += trace_path<Sampled>(primary, settings, triangles, count, nodes, grid, random);
     }
     // Power-of-two subgroups align with warp boundaries. Out-of-range lanes
     // contribute zero but still execute every shuffle under the full warp mask.
@@ -443,8 +449,8 @@ __global__ void paths(RenderSettings settings, const Primitive* triangles, int c
     }
 }
 
-// Average linear radiance over all subpixels and samples; host uses to_pixel().
-__global__ void average(RenderSettings settings, const Vec3* sums, Vec3* colors, size_t pixels) {
+// Average linear radiance, then tone-map and convert to RGB on the GPU.
+__global__ void average(RenderSettings settings, const Vec3* sums, Pixel* colors, size_t pixels) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= pixels) return;
     const int ss = settings.supersampling_factor, width = settings.width * ss;
@@ -456,7 +462,7 @@ __global__ void average(RenderSettings settings, const Vec3* sums, Vec3* colors,
     Vec3 color;
     for (int y = 0; y < ss; ++y)
         for (int x = 0; x < ss; ++x) color += sums[start + size_t(y) * width + x];
-    colors[i] = color / (float(settings.samples_per_pixel) * ss * ss);
+    colors[i] = to_pixel(color / (float(settings.samples_per_pixel) * ss * ss));
 }
 } // namespace
 
@@ -464,10 +470,8 @@ std::vector<Pixel> render_scene(
     const RenderSettings& settings,
     const std::vector<Object>& objects
 ) {
-    // CUDA is available, and the caller supplies valid settings within the
-    // assignment limits (128 objects, at most 256 triangles per object).
-    // The CPU only packs the existing triangle/material records. Bounds,
-    // spatial sorting, tree links and parent boxes are all calculated on the GPU.
+    // Scene input is host-owned. Upload once; construction and searches stay
+    // on device for either backend. Materials use the existing constant table.
     std::vector<Primitive> host_triangles;
     std::vector<Material> host_materials;
     host_triangles.reserve(objects.size() * 256);
@@ -479,8 +483,9 @@ std::vector<Pixel> render_scene(
     }
     const int count = int(host_triangles.size());
 
-    int device; cudaGetDevice(&device);
-    cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device);
+    if (objects.size() > 128) throw std::runtime_error("At most 128 materials supported");
+    int device; cuda_check(cudaGetDevice(&device));
+    cudaDeviceProp prop; cuda_check(cudaGetDeviceProperties(&prop, device));
     // pixels is the final width*height count. Supersampling factor ss creates
     // ss^2 subpixels per pixel, each receiving samples_per_pixel complete paths.
     const size_t pixels = size_t(settings.width) * settings.height;
@@ -497,35 +502,33 @@ std::vector<Pixel> render_scene(
     while (subpixels * split < target && split < settings.samples_per_pixel && split < (1 << 24)) split *= 2;
     const int block = 128;
     DeviceBuffer<Primitive> triangles(count);
-    DeviceBuffer<Node> nodes(bvh_node_count(count));
-    DeviceBuffer<Vec3> sums(subpixels), colors(pixels);
-    // These are the four GPU arrays, with different roles:
-    //   triangles: uploaded records, reordered on the GPU before ray tracing.
-    //   nodes: flat Node records, read during BVH traversal.
-    //   sums: accumulated linear RGB per subpixel, written atomically by paths().
-    //   colors: averaged linear RGB per output pixel, written by average().
-    // Materials use the separate con
-    // stant-memory table rather than another buffer.
-    // Upload geometry once per call. All bounces read these resident arrays;
-    // albedo/emission use the separate small constant-memory material table.
-    if (count) cudaMemcpy(triangles.data, host_triangles.data(), count * sizeof(Primitive), cudaMemcpyHostToDevice);
-    build_bvh(triangles.data, count, nodes.data);
+    DeviceBuffer<Node> nodes(settings.sampled_intersections ? 0 : bvh_node_count(count));
+    OwnedSampleGrid grid;
+    DeviceBuffer<Vec3> sums(subpixels);
+    DeviceBuffer<Pixel> colors(pixels);
+    // The sampled backend does not allocate or build BVH nodes. Cubes share
+    // samples through integer references, avoiding repeated attribute storage.
+    if (count) cuda_check(cudaMemcpy(triangles.data, host_triangles.data(), count * sizeof(Primitive), cudaMemcpyHostToDevice));
+    if (settings.sampled_intersections) build_sample_grid(triangles.data, count, settings, grid);
+    else build_bvh(triangles.data, count, nodes.data);
     if (!host_materials.empty()) {
-        cudaMemcpyToSymbol(materials, host_materials.data(), host_materials.size() * sizeof(Material));
+        cuda_check(cudaMemcpyToSymbol(materials, host_materials.data(), host_materials.size() * sizeof(Material)));
     }
     // Atomic accumulation requires a zeroed sum for every subpixel.
-    cudaMemset(sums.data, 0, subpixels * sizeof(Vec3));
+    cuda_check(cudaMemset(sums.data, 0, subpixels * sizeof(Vec3)));
     const size_t blocks = (subpixels * split + block - 1) / block;
     // Round up because the last block may be partially used. paths() guards its
     // scene work for those extra threads while still including them in shuffles.
-    paths<<<unsigned(blocks), block>>>(settings, triangles.data, count, nodes.data, sums.data, subpixels, split);
+    if (settings.sampled_intersections)
+        paths<true><<<unsigned(blocks), block>>>(settings, triangles.data, count, nodes.data, grid.view, sums.data, subpixels, split);
+    else
+        paths<false><<<unsigned(blocks), block>>>(settings, triangles.data, count, nodes.data, grid.view, sums.data, subpixels, split);
     // Both kernels use the default stream, so averaging waits for all path sums.
     average<<<unsigned((pixels + 255) / 256), 256>>>(settings, sums.data, colors.data, pixels);
-    std::vector<Vec3> host_colors(pixels);
-    // This blocking copy waits for GPU completion before the host reads colors.
-    // Apply the supplied tone mapping/gamma conversion only after linear averaging.
-    cudaMemcpy(host_colors.data(), colors.data, pixels * sizeof(Vec3), cudaMemcpyDeviceToHost);
+    cuda_check(cudaGetLastError());
     std::vector<Pixel> result(pixels);
-    for (size_t i = 0; i < pixels; ++i) result[i] = to_pixel(host_colors[i]);
+    // Tone mapping and gamma conversion also run on the GPU. Only final RGB
+    // bytes cross back to the host; this copy synchronizes and reports failures.
+    cuda_check(cudaMemcpy(result.data(), colors.data, pixels * sizeof(Pixel), cudaMemcpyDeviceToHost));
     return result;
 }
