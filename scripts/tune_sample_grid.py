@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import re
 import statistics
+import shutil
 import subprocess
 
 
@@ -54,14 +55,14 @@ def main():
             'backend', 'D', 'R', 'cube_size', 'case', 'repeat', 'seconds', 'error', 'pass', 'speedup'])
         writer.writeheader()
 
-        def measure(backend, options, distances=('', '', '')):
+        def measure(backend, options, distances=('', '', ''), executable=None):
             medians = []
             passes = True
             for case, (scene, reference) in enumerate(args.case):
                 times = []
                 for repeat in range(args.repeats):
                     prefix = f'{backend}_{distances[0]}_{distances[1]}_{distances[2]}_{case}_{repeat}'
-                    seconds, error, passed = run(args.executable, scene, reference,
+                    seconds, error, passed = run(executable or args.executable, scene, reference,
                         args.output_dir / (prefix + '.ppm'),
                         ['--intersection', backend, '--seed', str(args.seed), *options])
                     passes &= passed and seconds is not None
@@ -82,20 +83,32 @@ def main():
             raise SystemExit(f'BVH baseline failed a checker/run; inspect {args.output_dir} logs. '
                              'References must include max-error metadata.')
         baseline.update(enumerate(times))
-        for spacing, radius, cube in itertools.product(args.spacing, args.radius, args.cube_size):
-            options = ['--sample-spacing', str(spacing), '--acceptance-radius', str(radius), '--cube-size', str(cube)]
-            passed, times = measure('sampled', options, (spacing, radius, cube))
-            total = sum(times)
-            if passed and (best is None or total < best['total_median_seconds']):
-                best = dict(D=spacing, R=radius, cube_size=cube,
-                            total_median_seconds=total, speedup=sum(baseline.values()) / total,
-                            case_median_seconds=times, options=options)
+        project = Path(__file__).resolve().parents[1]
+        for spacing, cube in itertools.product(args.spacing, args.cube_size):
+            definitions = f'-DSAMPLED_SPACING={spacing}f -DSAMPLED_CUBE_SIZE={cube}f'
+            build = subprocess.run(['make', '-B', 'path_tracing', f'CPPFLAGS={definitions}'],
+                                   cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            (args.output_dir / f'build_{spacing}_{cube}.log').write_text(build.stdout)
+            if build.returncode:
+                raise SystemExit(f'Build failed for D={spacing}, cube={cube}; inspect build log')
+            binary = (args.output_dir / f'renderer_{spacing}_{cube}').resolve()
+            shutil.copy2(project / 'path_tracing', binary)
+            for radius in args.radius:
+                options = ['--acceptance-radius', str(radius)]
+                passed, times = measure('sampled', options, (spacing, radius, cube), str(binary))
+                total = sum(times)
+                if passed and (best is None or total < best['total_median_seconds']):
+                    best = dict(D=spacing, R=radius, cube_size=cube,
+                                total_median_seconds=total, speedup=sum(baseline.values()) / total,
+                                case_median_seconds=times, options=options,
+                                build_definitions=definitions, executable=str(binary))
     summary = dict(cases=args.case, repeats=args.repeats, seed=args.seed,
                    baseline_median_seconds=list(baseline.values()), best=best)
     (args.output_dir / 'best.json').write_text(json.dumps(summary, indent=2) + '\n')
     if best is None:
         raise SystemExit(f'No sampled settings passed all checker runs. Results: {csv_path}')
-    print(f'Fastest passing settings: {" ".join(best["options"])}')
+    print(f'Fastest passing constants: D={best["D"]}, cube_size={best["cube_size"]}')
+    print(f'Run: {best["executable"]} SCENE {" ".join(best["options"])}')
     print(f'Speedup against BVH: {best["speedup"]:.3f}x; results: {csv_path}')
 
 

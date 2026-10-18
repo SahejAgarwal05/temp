@@ -15,6 +15,7 @@ with tempfile.TemporaryDirectory(prefix='sample-grid-') as temp:
 #define __global__
 #define __forceinline__ inline
 #include "utils.cuh"
+#include "sampled_config.cuh"
 #include <algorithm>
 #include <iostream>
 #include <random>
@@ -30,9 +31,10 @@ int main() {
  auto require=[](bool ok) { if(!ok)throw std::runtime_error("Host rule/sampling/CLI check failed"); };
  {
   RenderSettings settings{};std::string out,ref,error;
-  const char* args[]={"--intersection","bvh","--sample-spacing",".13","--acceptance-radius",".23","--cube-size",".1"};
-  require(rtscene_detail::parse_cli_args(8,const_cast<char**>(args),settings,out,ref,error));
-  require(!settings.sampled_intersections && settings.sample_spacing==.13f && settings.acceptance_radius==.23f && settings.cube_size==.1f);
+  const char* args[]={"--intersection","bvh","--acceptance-radius",".23"};
+  require(rtscene_detail::parse_cli_args(4,const_cast<char**>(args),settings,out,ref,error));
+  require(!settings.sampled_intersections && settings.acceptance_radius==.23f);
+  require(SampleGridConfig::spacing==.02f && SampleGridConfig::cube_size==.08f);
   const char* bad[]={"--sample-spacing","0"};
   require(!rtscene_detail::parse_cli_args(2,const_cast<char**>(bad),settings,out,ref,error));
   const char* invalid[]={"--intersection","invalid"};

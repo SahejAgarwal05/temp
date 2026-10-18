@@ -68,9 +68,7 @@ inline bool parse_cli_args(int argc, char* const* argv,
         else if (option == "--camera_position") scalar = &parsed.camera_position;
         else if (option == "--screen_width") scalar = &parsed.screen_width;
         else if (option == "--screen_height") scalar = &parsed.screen_height;
-        else if (option == "--sample-spacing") scalar = &parsed.sample_spacing;
         else if (option == "--acceptance-radius") scalar = &parsed.acceptance_radius;
-        else if (option == "--cube-size") scalar = &parsed.cube_size;
         else if (option == "--intersection") {
             std::string backend;
             if (!read(backend)) return false;

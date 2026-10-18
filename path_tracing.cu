@@ -6,6 +6,7 @@
 // Both share material shading, bounce sampling, sample distribution, averaging,
 // tone mapping and gamma conversion. Only final RGB bytes return to the CPU.
 #include "graphics.cuh"
+#include "sampled_config.cuh"
 #include "geometry.cuh"
 
 #include <cuda/atomic>

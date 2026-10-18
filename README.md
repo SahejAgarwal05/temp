@@ -5,14 +5,21 @@ Build and render on a CUDA machine:
 ```sh
 make
 ./path_tracing scenes/cornell_box.rtscene --output sampled.ppm \
-  --intersection sampled --sample-spacing 0.02 --acceptance-radius 0.02 --cube-size 0.08 \
+  --intersection sampled --acceptance-radius 0.02 \
   --correctness-check images/cornell_box.ppm
 ./path_tracing scenes/cornell_box.rtscene --output bvh.ppm \
   --intersection bvh --correctness-check images/cornell_box.ppm
 make test
 ```
 
-`--sample-spacing D`, `--acceptance-radius R`, and `--cube-size` are independent positive distances in scene units. The defaults above are starting values, **not measured or checker-certified settings**. The Makefile targets sm_80/sm_90; override `NVCCFLAGS` for other GPUs.
+D and cube edge length are compile-time constants in `sampled_config.cuh`:
+
+```cpp
+#define SAMPLED_SPACING 0.02f    // D
+#define SAMPLED_CUBE_SIZE 0.08f  // cube edge length
+```
+
+Edit these values and run `make` to rebuild. They have no renderer runtime arguments. R remains independently configurable with `--acceptance-radius` (default `0.02`). All distances use scene units. These defaults are starting values, **not measured or checker-certified settings**. The Makefile targets sm_80/sm_90; override `NVCCFLAGS` for other GPUs.
 
 The GPU subdivides each nondegenerate triangle into a triangular lattice whose neighbor spacing is at most D, including vertices and edges. Each sample stores position, unit normal, original triangle ID, and a material-table index. GPU counts, prefix scans and atomic scatter build contiguous cube ranges of sample IDs. Every cube touching the closed `P ± R` box references that sample, including face/edge/corner contacts and radii larger than a cube.
 
@@ -30,6 +37,6 @@ python3 scripts/tune_sample_grid.py \
   --repeats 3 --output-dir grid_benchmark
 ```
 
-Add `--case SCENE REFERENCE` for every scene that must pass. References need the checker's `Max error` metadata. The script runs the BVH baseline and every independent D/R/cube combination with the same seed and scene render settings. It uses the renderer's `Time taken` (including construction, rendering and readback), records checker errors and speedups in `results.csv`, and saves images/logs for each run. `best.json` selects the smallest sum of per-scene median times **only among configurations passing every case and repeat**. It reports if none pass. Copy its printed options to render with the winning configuration; a passing approximation may still be slower than the BVH.
+Add `--case SCENE REFERENCE` for every scene that must pass. References need the checker's `Max error` metadata. The script runs the existing binary as the BVH baseline, rebuilds a separate binary for every D/cube combination using compiler definitions, then sweeps runtime R values with the same seed and scene render settings. Its `--spacing` and `--cube-size` options control compilation, not renderer runtime settings. The last compiled variant also remains at `./path_tracing`. It uses the renderer's `Time taken` (including construction, rendering and readback), records checker errors and speedups in `results.csv`, and saves images/logs for each run. `best.json` selects the smallest sum of per-scene median times **only among configurations passing every case and repeat**. It reports if none pass. Use its printed winning binary and R option, or copy the winning constants into `sampled_config.cuh` and rebuild; a passing approximation may still be slower than the BVH.
 
 Validation: `make test` compares actual GPU grid searches with exhaustive sample searches and checks sampling/materials, degenerates, rejection rules, ties, axis-parallel rays, cube boundaries, and R larger/smaller than cube size. `python3 tests/check_sample_grid_host.py` checks the same traversal math against exhaustive search without CUDA (requires clang++); it does not validate GPU kernels, scans, or atomics. CUDA compilation, image checks and timing require an NVIDIA/CUDA host; none were available on the development machine.

@@ -20,11 +20,9 @@ struct RenderSettings {
     int supersampling_factor;
     int max_bounces;
     std::uint32_t seed;
-    // Scene-unit distances; independently configurable for the sampled backend.
+    // D and cube edge length are compile-time constants in sampled_config.cuh.
     bool sampled_intersections = true;
-    float sample_spacing = 0.02f;
     float acceptance_radius = 0.02f;
-    float cube_size = 0.08f;
 };
 
 struct Pixel {

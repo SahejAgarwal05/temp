@@ -182,16 +182,17 @@ struct OwnedSampleGrid {
     OwnedSampleGrid(): samples(0), offsets(0), references(0) {}
 };
 
+template<class Config = SampleGridConfig>
 void build_sample_grid(const Primitive* triangles, int count, const RenderSettings& settings,
                        OwnedSampleGrid& owned) {
-    if (!(std::isfinite(settings.sample_spacing) && settings.sample_spacing > 0 &&
+    if (!(std::isfinite(Config::spacing) && Config::spacing > 0 &&
           std::isfinite(settings.acceptance_radius) && settings.acceptance_radius > 0 &&
-          std::isfinite(settings.cube_size) && settings.cube_size > 0))
+          std::isfinite(Config::cube_size) && Config::cube_size > 0))
         throw std::runtime_error("Sample spacing, acceptance radius and cube size must be finite and positive");
     if (!count) return;
     DeviceBuffer<int> divisions(count);
     DeviceBuffer<GridOffset> counts(count + 1), sample_offsets(count + 1);
-    sampling_counts<<<(count + 256) / 256, 256>>>(triangles, count, settings.sample_spacing,
+    sampling_counts<<<(count + 256) / 256, 256>>>(triangles, count, Config::spacing,
                                                divisions.data, counts.data);
     thrust::exclusive_scan(thrust::device, thrust::device_pointer_cast(counts.data),
         thrust::device_pointer_cast(counts.data + count + 1),
@@ -199,12 +200,12 @@ void build_sample_grid(const Primitive* triangles, int count, const RenderSettin
     GridOffset total;
     cuda_check(cudaMemcpy(&total, sample_offsets.data + count, sizeof(total), cudaMemcpyDeviceToHost));
     if (total > 2147483647ULL)
-        throw std::runtime_error("Too many surface samples; increase --sample-spacing");
+        throw std::runtime_error("Too many surface samples; increase SampleGridConfig::spacing and rebuild");
     if (!total) return;
     owned.samples.allocate(size_t(total));
     SampleGrid& g = owned.view;
     g.sample_count = int(total); g.samples = owned.samples.data;
-    g.radius = settings.acceptance_radius; g.cell = settings.cube_size;
+    g.radius = settings.acceptance_radius; g.cell = Config::cube_size;
     sample_surfaces<<<unsigned((total + 255) / 256), 256>>>(triangles, count, divisions.data,
         sample_offsets.data, owned.samples.data, int(total));
     DeviceBuffer<Node> bounds(1);
@@ -219,7 +220,7 @@ void build_sample_grid(const Primitive* triangles, int count, const RenderSettin
         const double span = double(highs[a]) + g.radius - lows[a];
         const double n = std::floor(span / g.cell) + 1;
         if (!std::isfinite(n) || n < 1 || n > 16777216 || cells > 134217728 / size_t(n))
-            throw std::runtime_error("Sample grid too large; increase --cube-size");
+            throw std::runtime_error("Sample grid too large; increase SampleGridConfig::cube_size and rebuild");
         g.dims[a] = int(n); cells *= size_t(n);
         highs[a] = lows[a] + g.dims[a] * g.cell;
         if (!std::isfinite(lows[a]) || !std::isfinite(highs[a]) ||

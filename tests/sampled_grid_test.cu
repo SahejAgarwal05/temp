@@ -59,7 +59,9 @@ void candidate_tests() {
     require(result[2] == 6, "Radius equality or deterministic tie break failed");
 }
 
-void grid_tests(float spacing, float radius, float cell_size) {
+template<class Config>
+void grid_tests(float radius) {
+    constexpr float spacing = Config::spacing, cell_size = Config::cube_size;
     const Primitive triangles[] = {
         {{Vec3(0, 0, 0), Vec3(1, 0, 0), Vec3(0, 1, 0)}, 0, 0, 0},
         // Degenerate triangle in the middle exercises repeated prefix offsets.
@@ -69,9 +71,9 @@ void grid_tests(float spacing, float radius, float cell_size) {
     DeviceBuffer<Primitive> data(3);
     cuda_check(cudaMemcpy(data.data, triangles, sizeof(triangles), cudaMemcpyHostToDevice));
     RenderSettings settings{};
-    settings.sample_spacing = spacing; settings.acceptance_radius = radius; settings.cube_size = cell_size;
+    settings.acceptance_radius = radius;
     OwnedSampleGrid owned;
-    build_sample_grid(data.data, 3, settings, owned);
+    build_sample_grid<Config>(data.data, 3, settings, owned);
     const SampleGrid g = owned.view;
     std::vector<SurfaceSample> samples(g.sample_count);
     cuda_check(cudaMemcpy(samples.data(), g.samples, samples.size() * sizeof(SurfaceSample), cudaMemcpyDeviceToHost));
@@ -123,11 +125,15 @@ void grid_tests(float spacing, float radius, float cell_size) {
     require(failed == 0, "Grid search differs from exhaustive sample search");
 }
 
+struct LargeCells { static constexpr float spacing = .13f, cube_size = .2f; };
+struct MediumCells { static constexpr float spacing = .13f, cube_size = .1f; };
+struct SmallCells { static constexpr float spacing = .13f, cube_size = .04f; };
+
 int main() try {
     candidate_tests();
-    grid_tests(.13f, .07f, .2f);
-    grid_tests(.13f, .23f, .1f); // R spans more than one cube in each direction
-    grid_tests(.13f, .003f, .04f); // R much smaller than D and cube size
+    grid_tests<LargeCells>(.07f);
+    grid_tests<MediumCells>(.23f); // R spans more than one cube in each direction
+    grid_tests<SmallCells>(.003f); // R much smaller than D and cube size
     OwnedSampleGrid empty;
     RenderSettings settings{};
     build_sample_grid(nullptr, 0, settings, empty);
