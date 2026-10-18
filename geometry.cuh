@@ -127,14 +127,6 @@ __host__ __device__ inline Ray make_ray(const Vec3& from, const Vec3& to) {
 
 
 /*
-Return true if the ray might intersect the object, false otherwise.
-This function checks if the ray intersects the bounding sphere of the object.
-*/
-__host__ __device__ inline bool might_intersect_object(const Ray& ray, const Object& object) {
-    return intersect_sphere(ray, object.bound);
-}
-
-/*
 Return true if the ray intersects the sphere, false otherwise.
 The ray's direction is assumed to be normalized.
 */
@@ -145,13 +137,21 @@ __host__ __device__ inline bool intersect_sphere(
     float distance = length(cross((ray.origin - sphere.center), ray.direction)) / length(ray.direction); //Distance of point from line formula
     if (distance < EPSILON) {
         return false;
-    } 
+    }
     else if (distance < sphere.radius) {
         return true;
     }
     else {
         return false;
     }
+}
+
+/*
+Return true if the ray might intersect the object, false otherwise.
+This function checks if the ray intersects the bounding sphere of the object.
+*/
+__host__ __device__ inline bool might_intersect_object(const Ray& ray, const Object& object) {
+    return intersect_sphere(ray, object.bound);
 }
 
 /*

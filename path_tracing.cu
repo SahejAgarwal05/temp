@@ -5,4 +5,5 @@ std::vector<Pixel> render_scene(
     const RenderSettings& settings,
     const std::vector<Object>& objects
 ) {
+    return {};
 }
