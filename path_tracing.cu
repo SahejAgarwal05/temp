@@ -230,21 +230,24 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
-
+__device__ void atomicMin(Hit* hit, const Hit& new_hit) {
+    if (new_hit.record.t < hit->record.t) {
+        *hit = new_hit;
+    }
+}
 __device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    for (int i = leaf.startIndex; i < leaf.startIndex + leaf.n; ++i) {
-        const GPUTriangle& triangle = triangles[i];
-        if (triangle.triangle_index == previous_triangle) continue;
-        HitRecord record;
-        if (intersect_triangle(ray, triangle.triangle, &record) &&
-            (record.t < hit.record.t ||
-             (record.t == hit.record.t && triangle.triangle_index < hit.triangle_index))) {
-            hit.record = record;
-            hit.object_index = triangle.object_index;
-            hit.triangle_index = triangle.triangle_index;
+    int idx = leaf.startIndex + threadIdx.x + blockIdx.x * blockDim.x;
+    Hit local_hit;
+    if (idx < leaf.startIndex + leaf.n) {
+        const GPUTriangle& triangle = triangles[idx];
+        if (idx != previous_triangle) {
+            local_hit.record = intersectTriangle(ray, triangle.triangle);
+            atomicMin(&hit, local_hit);
         }
     }
+    syncthreads();
+
 }
 
 // Fall back to the original traversal if an unusually deep tree fills the stack.
@@ -287,7 +290,6 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                 float left_entry, right_entry;
                 const bool hit_left = intersectNode(ray, nodes[left_child], hit.record.t, left_entry);
                 const bool hit_right = intersectNode(ray, nodes[right_child], hit.record.t, right_entry);
-
                 if (hit_left && hit_right) {
                     const bool left_is_nearer = left_entry <= right_entry;
                     // Save the farther child and immediately descend into the nearer one.
