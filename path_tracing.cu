@@ -187,7 +187,7 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, con
 __global__ void buildBVHBounds(int node_count, LeafNode* nodes, GPUTriangle* triangles) {
     const int node_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (node_index >= node_count) return;
-    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n,);
+    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n);
     nodes[node_index].lowCorner = box.lowCorner;
     nodes[node_index].highCorner = box.highCorner;
 }
