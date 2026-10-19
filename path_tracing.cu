@@ -42,7 +42,6 @@ struct GPUTriangle {
     Triangle triangle;
     int object_index;
     int triangle_index; // Original flattened ID, preserved through sorting.
-    int node_index;
     Vec3 edge0 = triangle.p1 - triangle.p0;
     Vec3 edge1 = triangle.p2 - triangle.p0;
     Vec3 normal = normalize(cross(edge0, edge1));
@@ -538,7 +537,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
             deltas
         );
 
-
+        cudaFree(mortonCodes);
         // 11. Build BVH
         buildBVH(
             bvh_node_count,
