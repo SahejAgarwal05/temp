@@ -51,7 +51,7 @@ struct GPUTriangle {
                           fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
                           fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
     __host__ __device__ GPUTriangle() = default;
-    __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle):
+    __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle2):
         object_index(object_index), triangle_index(triangle_index) {
             highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
                              fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
@@ -59,8 +59,8 @@ struct GPUTriangle {
             lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
                             fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
                             fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
-            edge0 = triangle.p1 - triangle.p0;
-            edge1 = triangle.p2 - triangle.p0;
+            edge0 = triangle2.p1 - triangle2.p0;
+            edge1 = triangle2.p2 - triangle2.p0;
             normal = normalize(cross(edge0, edge1));
         }
 };
@@ -241,7 +241,7 @@ __device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord*
     }
 
     const float inverse_determinant = 1.0 / determinant;
-    const Vec3 offset = ray.origin - triangle.triangle.p0;
+    const Vec3 offset = ray.origin - triangle.p0;
     const float u = dot(offset, p) * inverse_determinant;
     if (u < 0.0 || u > 1.0) {
         return false;
