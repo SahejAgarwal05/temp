@@ -314,26 +314,39 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
 
 __global__ void renderPixels(RenderSettings settings, const GPUTriangle* triangles,
                              const LeafNode* nodes, int n_nodes,
-                             const ObjectMaterial* materials, Pixel* pixels, size_t n_pixels) {
+                             const ObjectMaterial* materials, Vec3* subpixel_colors, size_t n_subpixels) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n_subpixels) return;
+    const size_t width = size_t(settings.width) * settings.supersampling_factor;
+    const int x = int(index % width), y = int(index / width);
+    // Each subpixel independently traces its camera ray and samples.
+    RandomGPU random(index);
+    const Ray ray = make_camera_ray(settings, x, y);
+    Vec3 color;
+    for (int sample = 0; sample < settings.samples_per_pixel; ++sample)
+        color += tracePath(ray, settings, triangles, nodes, n_nodes, materials, random);
+    subpixel_colors[index] = color / float(settings.samples_per_pixel);
+}
+
+__global__ void averageSubpixels(RenderSettings settings, const Vec3* subpixel_colors,
+                                 Pixel* pixels, size_t n_pixels) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= n_pixels) return;
-    const int x = int(index % settings.width), y = int(index / settings.width);
     const int ss = settings.supersampling_factor;
-    // Each output pixel owns its random stream and all of its subpixel samples.
-    RandomGPU random(index);
+    const size_t width = size_t(settings.width) * ss;
+    const size_t start = (index / settings.width * ss) * width + (index % settings.width) * ss;
     Vec3 color;
     for (int dy = 0; dy < ss; ++dy) {
-        for (int dx = 0; dx < ss; ++dx) {
-            const Ray ray = make_camera_ray(settings, x * ss + dx, y * ss + dy);
-            for (int sample = 0; sample < settings.samples_per_pixel; ++sample)
-                color += tracePath(ray, settings, triangles, nodes, n_nodes, materials, random);
-        }
+        for (int dx = 0; dx < ss; ++dx)
+            color += subpixel_colors[start + size_t(dy) * width + dx];
     }
-    pixels[index] = to_pixel(color / (float(settings.samples_per_pixel) * ss * ss));
+    // Average linear colors before tone mapping and gamma correction.
+    pixels[index] = to_pixel(color / (float(ss) * ss));
 }
 
 std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vector<Object>& objects) {
     const size_t n_pixels = size_t(settings.width) * settings.height;
+    const size_t n_subpixels = n_pixels * settings.supersampling_factor * settings.supersampling_factor;
     // 1. Collect triangles and materials on CPU
     std::vector<Triangle> triangles;
     std::vector<int> triangle_object_indices;
@@ -368,6 +381,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     unsigned long* mortonCodes = nullptr;
     unsigned long* deltas = nullptr;
     Pixel* gpu_pixels = nullptr;
+    Vec3* gpu_subpixel_colors = nullptr;
     auto release = [&]() {
         cudaFree(gpu_raw_triangles);
         cudaFree(gpu_triangle_object_indices);
@@ -377,6 +391,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaFree(mortonCodes);
         cudaFree(deltas);
         cudaFree(gpu_pixels);
+        cudaFree(gpu_subpixel_colors);
     };
     cudaMalloc(&gpu_raw_triangles, n_triangles * sizeof(Triangle));
     cudaMalloc(&gpu_triangle_object_indices, n_triangles * sizeof(int));
@@ -471,8 +486,11 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
 
         // 12. Trace samples, average subpixels, and return the final image.
         cudaMalloc(&gpu_pixels, n_pixels * sizeof(Pixel));
-        renderPixels<<<unsigned((n_pixels + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_triangles, gpu_nodes, n_nodes, gpu_materials, gpu_pixels, n_pixels);
+        cudaMalloc(&gpu_subpixel_colors, n_subpixels * sizeof(Vec3));
+        renderPixels<<<unsigned((n_subpixels + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+            settings, gpu_triangles, gpu_nodes, n_nodes, gpu_materials, gpu_subpixel_colors, n_subpixels);
+        averageSubpixels<<<unsigned((n_pixels + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+            settings, gpu_subpixel_colors, gpu_pixels, n_pixels);
         std::vector<Pixel> pixels(n_pixels);
         cudaMemcpy(pixels.data(), gpu_pixels, n_pixels * sizeof(Pixel), cudaMemcpyDeviceToHost);
         release();
