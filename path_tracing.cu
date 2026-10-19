@@ -295,7 +295,7 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                     node_index = left_is_nearer ? left_child : right_child;
                     continue;
                 }
-                elseif (hit_left || hit_right) {
+                else if (hit_left || hit_right) {
                     node_index = hit_left ? left_child : right_child;
                     continue;
                 }
