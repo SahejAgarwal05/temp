@@ -235,7 +235,7 @@ __device__ void atomicMin(Hit* hit, const Hit& new_hit) {
         *hit = new_hit;
     }
 }
-__global__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
+__device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
     
     Hit hit1, hit2;
