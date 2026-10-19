@@ -230,56 +230,27 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
-__device__ void atomicMin(Hit* hit, const Hit& new_hit) {
-    if (new_hit.record.t < hit->record.t) {
-        *hit = new_hit;
+__device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
+                                int previous_triangle, Hit& closest) {
+    if (triangle.triangle_index == previous_triangle) return;
+    HitRecord record;
+    if (!intersect_triangle(ray, triangle.triangle, &record)) return;
+    if (record.t < closest.record.t ||
+        (record.t == closest.record.t && triangle.triangle_index < closest.triangle_index)) {
+        closest.record = record;
+        closest.object_index = triangle.object_index;
+        closest.triangle_index = triangle.triangle_index;
     }
 }
+
 __device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    
-    Hit hit1, hit2;
-    if (previous_triangle == leaf.startIndex) {
-        intersect_triangle(ray, triangles[leaf.startIndex + 1].triangle, &hit2.record);
-        hit = hit2;
-        hit.object_index = triangles[leaf.startIndex + 1].object_index;
-        hit.triangle_index = triangles[leaf.startIndex + 1].triangle_index;
-        return;
-    }
-    if (previous_triangle == leaf.startIndex + 1) {
-        intersect_triangle(ray, triangles[leaf.startIndex].triangle, &hit1.record);
-        hit = hit1;
-        hit.object_index = triangles[leaf.startIndex].object_index;
-        hit.triangle_index = triangles[leaf.startIndex].triangle_index;
-        return;
-    }
-    bool h1 = intersect_triangle(ray, triangles[leaf.startIndex].triangle, &hit1.record);
-    bool h2 = intersect_triangle(ray, triangles[leaf.startIndex + 1].triangle, &hit2.record);
-    if (!h1 && !h2) return;
-    if (!h1) {
-        hit = hit2;
-        hit.object_index = triangles[leaf.startIndex + 1].object_index;
-        hit.triangle_index = triangles[leaf.startIndex + 1].triangle_index;
-        return;
-
-    }
-    if (!h2) {
-        hit = hit1;
-        hit.object_index = triangles[leaf.startIndex].object_index;
-        hit.triangle_index = triangles[leaf.startIndex].triangle_index;
-        return;
-    }
-    if(hit1.record.t <hit2.record.t) {
-        hit = hit1;
-        hit.object_index = triangles[leaf.startIndex].object_index;
-        hit.triangle_index = triangles[leaf.startIndex].triangle_index;
-        return;
-    }
-    hit = hit2;
-    hit.object_index = triangles[leaf.startIndex + 1].object_index;
-    hit.triangle_index = triangles[leaf.startIndex + 1].triangle_index;
+    static_assert(MAX_LEAF_SIZE == 2, "The two explicit tests require two-triangle leaves");
+    if (leaf.n > 0)
+        testTriangleHit(ray, triangles[leaf.startIndex], previous_triangle, hit);
+    if (leaf.n > 1)
+        testTriangleHit(ray, triangles[leaf.startIndex + 1], previous_triangle, hit);
 }
-
 
 __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                           const LeafNode* nodes, int n_nodes, int previous_triangle) {
@@ -304,6 +275,12 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                 const bool hit_left = intersectNode(ray, nodes[left_child], hit.record.t, left_entry);
                 const bool hit_right = intersectNode(ray, nodes[right_child], hit.record.t, right_entry);
                 if (hit_left && hit_right) {
+                    if (pending_count == STACK_CAPACITY) {
+                        // Keep correctness even for a tree deeper than the local stack.
+                        for (int i = 0; i < nodes[0].n; ++i)
+                            testTriangleHit(ray, triangles[i], previous_triangle, hit);
+                        return hit;
+                    }
                     const bool left_is_nearer = left_entry <= right_entry;
                     // Save the farther child and immediately descend into the nearer one.
                     pending_nodes[pending_count++] = left_is_nearer ? right_child : left_child;
