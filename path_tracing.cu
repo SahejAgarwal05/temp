@@ -239,8 +239,8 @@ __device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
     
     Hit hit1, hit2;
-    intersect_triangle(ray, triangles[leaf.startIndex], previous_triangle, hit1);
-    intersect_triangle(ray, triangles[leaf.startIndex + 1], previous_triangle, hit2);
+    intersect_triangle(ray, triangles[leaf.startIndex].triangle, previous_triangle, hit1);
+    intersect_triangle(ray, triangles[leaf.startIndex + 1].triangle, previous_triangle, hit2);
     if(hit1.record.t <hit.record.t) {
         hit = hit1;
         return;
