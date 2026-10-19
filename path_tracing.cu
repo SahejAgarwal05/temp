@@ -124,48 +124,27 @@ __global__ void calcDelta(int n, const unsigned long long* mortonCodes, unsigned
     deltas[idx] = (rank << 32) | (IDX_MASK - static_cast<unsigned long long>(idx));
 }
 
-// One block finds a split between whole leaf groups. The low key bits already
-// break ties, so the winning key must stay intact until its index is decoded.
-__device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* triangles,
-                          const unsigned long long* deltas, unsigned long long* best,
-                          int node_index, LeafNode* nodes) {
+// Find the largest delta between complete leaf groups, then create both children.
+__device__ void splitNode(const unsigned long long* deltas, int node_index, LeafNode* nodes) {
     const int start = nodes[node_index].startIndex;
     const int n = nodes[node_index].n;
-    if (n <= MAX_LEAF_SIZE) return;
+    const unsigned long long *i = thrust::max_element(thrust::device, deltas + start, deltas + start + n - 1);
+    int split_index = i - deltas;
+    nodes[node_index].rightNodeIndex = node_index + 1 + (split_index - start) / MAX_LEAF_SIZE;
+    nodes[node_index + 1].startIndex = start;
+    nodes[node_index + 1].n = split_index - start + 1;
+    nodes[nodes[node_index].rightNodeIndex].startIndex = split_index + 1;
+    nodes[nodes[node_index].rightNodeIndex].n = start + n - split_index - 1;
 
-    if (threadIdx.x == 0) *best = 0;
-    __syncthreads();
-    // Consider only boundaries between complete leaf groups.
-    for (int i = start + MAX_LEAF_SIZE - 1 + threadIdx.x * MAX_LEAF_SIZE;
-         i < start + n - 1; i += blockDim.x * MAX_LEAF_SIZE)
-        atomicMax(best, deltas[i]);
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        // The key already contains a unique split index; keep it intact.
-        const int split = static_cast<int>(IDX_MASK - (*best & IDX_MASK));
-        const int left_n = split + 1 - start;
-        const int left = node_index + 1;
-        const int right = left + countNodes(left_n);
-        nodes[node_index].rightNodeIndex = right;
-        nodes[left] = LeafNode(left_n, start, node_index);
-        nodes[right] = LeafNode(n - left_n, start + left_n, node_index);
-    }
-    __syncthreads();
 }
 
-__global__ void buildBVHSubtree(
-    int n_triangles, int n_nodes, GPUTriangle* triangles,
-    const unsigned long long* deltas, LeafNode* nodes,
-    unsigned long long* best, int first_node, int second_node)
-{
-    if (threadIdx.x == 0) nodes[first_node] = LeafNode(n_triangles);
-    // Preorder guarantees parents are initialized before their children.
-    // A single cooperating block avoids device-side recursive launches and
-    // their extra compiler/linker requirements on the server.
-    for (int index = first_node; index < n_nodes; ++index) {
-        splitNode(n_triangles, n_nodes, triangles, deltas, best + index, index, nodes);
-    }
+__global__ void buildBVHSubtree(int triangle_count, int node_count,
+                               const unsigned long long* deltas, LeafNode* nodes) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    nodes[0] = LeafNode(triangle_count);
+    // Preorder puts every parent before its children.
+    for (int node_index = 0; node_index < node_count; ++node_index)
+        splitNode(deltas, node_index, nodes);
 }
 
 __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {
@@ -208,12 +187,8 @@ __global__ void buildBVHBounds(int n_nodes, LeafNode* gpu_nodes, GPUTriangle* gp
 void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes, const unsigned long long* deltas) {
     if (n_nodes == 0) return;
-    unsigned long long* best = nullptr;
-    cudaMalloc(&best, n_nodes * sizeof(unsigned long long));
-    buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
-                                           deltas, gpu_nodes, best, 0, -1);
+    buildBVHSubtree<<<1, 1>>>(n_triangles, n_nodes, deltas, gpu_nodes);
     buildBVHBounds<<<1, 1>>>(n_nodes, gpu_nodes, gpu_triangles);
-    cudaFree(best);
 }
 
 __global__ void convertToGPUTriagles(int n_triangles, unsigned long long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
