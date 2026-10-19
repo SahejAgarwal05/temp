@@ -207,7 +207,7 @@ __global__ void convertToGPUTriagles(int n_triangles, unsigned long long* morton
     morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, fullSpace);
 }
 // Slab intersection, including rays parallel to a face of the box.
-__device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest) {
+__device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest, float& entry_distance) {
     // Triangle intersection and slab division can round the same distance
     // differently, especially for coplanar triangles. Only pruning gets slack.
     float near = 0.0f;
@@ -227,34 +227,83 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
             if (near > far) return false;
         }
     }
+    entry_distance = near;
     return true;
+}
+
+__device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
+                                  const LeafNode& leaf, int previous_triangle, Hit& hit) {
+    for (int i = leaf.startIndex; i < leaf.startIndex + leaf.n; ++i) {
+        const GPUTriangle& triangle = triangles[i];
+        if (triangle.triangle_index == previous_triangle) continue;
+        HitRecord record;
+        if (intersect_triangle(ray, triangle.triangle, &record) &&
+            (record.t < hit.record.t ||
+             (record.t == hit.record.t && triangle.triangle_index < hit.triangle_index))) {
+            hit.record = record;
+            hit.object_index = triangle.object_index;
+            hit.triangle_index = triangle.triangle_index;
+        }
+    }
+}
+
+// Fall back to the original traversal if an unusually deep tree fills the stack.
+__device__ Hit closestHitInOrder(const Ray& ray, const GPUTriangle* triangles,
+                                 const LeafNode* nodes, int node_count, int previous_triangle) {
+    Hit hit;
+    for (int node_index = 0; node_index < node_count;) {
+        const LeafNode& node = nodes[node_index];
+        float entry_distance;
+        if (!intersectNode(ray, node, hit.record.t, entry_distance)) {
+            node_index += countNodes(node.n);
+            continue;
+        }
+        if (node.rightNodeIndex == -1)
+            testLeafTriangles(ray, triangles, node, previous_triangle, hit);
+        ++node_index;
+    }
+    return hit;
 }
 
 __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                           const LeafNode* nodes, int n_nodes, int previous_triangle) {
     Hit hit;
-    // Preorder ranges allow a missed subtree to be skipped without a stack.
-    for (int index = 0; index < n_nodes;) {
-        const LeafNode& node = nodes[index];
-        if (!intersectNode(ray, node, hit.record.t)) {
-            index += countNodes(node.n);
-            continue;
-        }
-        if (node.rightNodeIndex == -1) {
-            for (int i = node.startIndex; i < node.startIndex + node.n; ++i) {
-                const GPUTriangle& triangle = triangles[i];
-                if (triangle.triangle_index == previous_triangle) continue;
-                HitRecord record;
-                if (intersect_triangle(ray, triangle.triangle, &record) &&
-                    (record.t < hit.record.t ||
-                     (record.t == hit.record.t && triangle.triangle_index < hit.triangle_index))) {
-                    hit.record = record;
-                    hit.object_index = triangle.object_index;
-                    hit.triangle_index = triangle.triangle_index;
+    if (n_nodes == 0) return hit;
+    constexpr int STACK_CAPACITY = 64;
+    int pending_nodes[STACK_CAPACITY];
+    int pending_count = 0;
+    int node_index = 0;
+
+    while (node_index != -1) {
+        const LeafNode& node = nodes[node_index];
+        float entry_distance;
+        // Recheck deferred nodes against any closer hit found in the meantime.
+        if (intersectNode(ray, node, hit.record.t, entry_distance)) {
+            if (node.rightNodeIndex == -1) {
+                testLeafTriangles(ray, triangles, node, previous_triangle, hit);
+            } else {
+                const int left_child = node_index + 1;
+                const int right_child = node.rightNodeIndex;
+                float left_entry, right_entry;
+                const bool hit_left = intersectNode(ray, nodes[left_child], hit.record.t, left_entry);
+                const bool hit_right = intersectNode(ray, nodes[right_child], hit.record.t, right_entry);
+
+                if (hit_left && hit_right) {
+                    if (pending_count == STACK_CAPACITY)
+                        return closestHitInOrder(ray, triangles, nodes, n_nodes, previous_triangle);
+                    const bool left_is_nearer = left_entry <= right_entry;
+                    // Save the farther child and immediately descend into the nearer one.
+                    pending_nodes[pending_count++] = left_is_nearer ? right_child : left_child;
+                    node_index = left_is_nearer ? left_child : right_child;
+                    continue;
+                }
+                if (hit_left || hit_right) {
+                    node_index = hit_left ? left_child : right_child;
+                    continue;
                 }
             }
         }
-        ++index;
+        node_index = pending_count > 0 ? pending_nodes[--pending_count] : -1;
     }
     return hit;
 }
@@ -269,7 +318,7 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
         // All samples of a subpixel share the deterministic camera intersection.
         const Hit hit = bounce == 0 && first_hit != nullptr
             ? *first_hit : closestHit(ray, triangles, nodes, n_nodes, previous_triangle);
-        if (!hit.hit() || length(throughout - zero) < EPSILON) {
+        if (!hit.hit() || length(throughput - zero) < EPSILON) {
             light += multiply(throughput, settings.background_light);
             break;
         }
