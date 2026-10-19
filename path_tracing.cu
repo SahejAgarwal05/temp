@@ -180,29 +180,25 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__global__ void calcNodeBox(int n_triangles, GPUTriangle* triangles, int start, int end, Vec3* lowCorner, Vec3* highCorner, int node_index, bool write_idx){ 
-    int idx = threadIdx.x + blockIdx.x * blockDim.x + start;
-    if (idx < end){
-        atomicMin(&lowCorner->x, triangles[idx].lowCorner.x);
-        atomicMin(&lowCorner->y, triangles[idx].lowCorner.y);
-        atomicMin(&lowCorner->z, triangles[idx].lowCorner.z);
-        atomicMax(&highCorner->x, triangles[idx].highCorner.x);
-        atomicMax(&highCorner->y, triangles[idx].highCorner.y);
-        atomicMax(&highCorner->z, triangles[idx].highCorner.z);
-        if (write_idx) {
-            triangles[idx].node_index = node_index;
-        }
+__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const LeafNode& node, int node_index) {
+    NodeBox box;
+    const bool is_leaf = node.rightNodeIndex == -1;
+    for (int triangle_index = node.startIndex; triangle_index < node.startIndex + node.n; ++triangle_index) {
+        GPUTriangle& triangle = triangles[triangle_index];
+        box.insert(triangle.lowCorner);
+        box.insert(triangle.highCorner);
+        if (is_leaf) triangle.node_index = node_index;
     }
+    box.pad();
+    return box;
 }
 
-
-__global__ void buildBVHBounds(int n_nodes, LeafNode* nodes, GPUTriangle* triangles) {
-    const int index = blockIdx.x;
-    if (index >= n_nodes) return;
-    const int start = nodes[index].startIndex;
-    const int end = start + nodes[index].n;
-    calcNodeBox(end, triangles, start, end, &nodes[index].lowCorner,
-                &nodes[index].highCorner, index, nodes[index].rightNodeIndex == -1);
+__global__ void buildBVHBounds(int node_count, LeafNode* nodes, GPUTriangle* triangles) {
+    const int node_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node_index >= node_count) return;
+    const NodeBox box = calcNodeBox(triangles, nodes[node_index], node_index);
+    nodes[node_index].lowCorner = box.lowCorner;
+    nodes[node_index].highCorner = box.highCorner;
 }
 
 // Call after initNodes, Morton sorting, and calcDelta.
@@ -213,7 +209,7 @@ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
     cudaMalloc(&best, n_nodes * sizeof(unsigned long));
     buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
                                            deltas, gpu_nodes, best, 0, -1);
-    buildBVHBounds<<<n_nodes, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
+    buildBVHBounds<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
 }
 
 __global__ void convertToGPUTriagles(int n_triangles, unsigned long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
