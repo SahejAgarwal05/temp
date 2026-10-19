@@ -230,7 +230,7 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
-__device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord* record) {
+__device__ bool intersect_triangle_gpu(const GPUTriangle& triangle, const Ray& ray, HitRecord* record) {
     // Implementation for GPU triangle intersection
     const Vec3 p = cross(ray.direction, triangle.edge1);
     const float determinant = dot(triangle.edge0, p);
@@ -245,17 +245,17 @@ __device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord*
         return false;
     }
 
-    const Vec3 q = cross(offset, triangle.edge1);
+    const Vec3 q = cross(offset, triangle.edge0);
     const float v = dot(ray.direction, q) * inverse_determinant;
     if (v < 0.0 || u + v > 1.0) {
         return false;
     }
 
-    const float t = dot(triangle.edge0, q) * inverse_determinant;
+    const float t = dot(triangle.edge1, q) * inverse_determinant;
     if (t <= EPSILON) {
         return false;
     }
-    record->unit_normal = - triangle.normal;
+    record->unit_normal = triangle.normal;
     if (dot(triangle.normal, ray.direction) > 0.0) {
         record->unit_normal *= -1;
     }
@@ -535,6 +535,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         );
 
         cudaFree(mortonCodes);
+        mortonCodes = nullptr;
         // 11. Build BVH
         buildBVH(
             bvh_node_count,
