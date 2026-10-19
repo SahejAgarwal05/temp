@@ -170,7 +170,7 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {
+__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {)
     NodeBox box;
     for (int i = startIndex; i < startIndex + n; ++i) {
         box.insert(triangles[i].lowCorner);
@@ -180,23 +180,35 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, con
     return box;
 }
 
-__global__ void buildBVHBounds(int node_count, LeafNode* nodes, GPUTriangle* triangles) {
-    const int node_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node_index >= node_count) return;
-    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n);
-    nodes[node_index].lowCorner = box.lowCorner;
-    nodes[node_index].highCorner = box.highCorner;
-}
+
 
 // Call after Morton sorting and calcDelta. The builder initializes its own nodes.
-void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
+__global__ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes, const unsigned long long* deltas) {
     if (n_nodes == 0) return;
     unsigned long long* best = nullptr;
     cudaMalloc(&best, n_nodes * sizeof(unsigned long long));
     buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
                                            deltas, gpu_nodes, best, 0, -1);
-    buildBVHBounds<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
+    for(int i = n_nodes - 1; i >= 0; --i) {
+        if(gpu_nodes[i].rightNodeIndex == -1) {
+            // Leaf node
+            NodeBox box = calcNodeBox(gpu_triangles, gpu_nodes[i].startIndex, gpu_nodes[i].n);
+            gpu_nodes[i].lowCorner = box.lowCorner;
+            gpu_nodes[i].highCorner = box.highCorner;
+        } else {
+            // Internal node
+            NodeBox box;
+            LeafNode leftChild = gpu_nodes[i + 1];
+            LeafNode rightChild = gpu_nodes[gpu_nodes[i].rightNodeIndex];
+            box.insert(leftChild.lowCorner);
+            box.insert(leftChild.highCorner);
+            box.insert(rightChild.lowCorner);
+            box.insert(rightChild.highCorner);
+            gpu_nodes[i].lowCorner = box.lowCorner;
+            gpu_nodes[i].highCorner = box.highCorner;
+        }
+    }
     cudaFree(best);
 }
 
