@@ -239,13 +239,13 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
 __device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord* record) {
     // Implementation for GPU triangle intersection
     const Vec3 p = cross(ray.direction, triangle.edge1);
-    const float determinant = dot(triangle.edge1, p);
+    const float determinant = dot(triangle.edge0, p);
     if (std::fabs(determinant) <= EPSILON) {
         return false;
     }
 
     const float inverse_determinant = 1.0 / determinant;
-    const Vec3 offset = ray.origin - triangle.p0;
+    const Vec3 offset = ray.origin - triangle.triangle.p0;
     const float u = dot(offset, p) * inverse_determinant;
     if (u < 0.0 || u > 1.0) {
         return false;
@@ -257,7 +257,7 @@ __device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord*
         return false;
     }
 
-    const float t = dot(triangle.edge2, q) * inverse_determinant;
+    const float t = dot(triangle.edge0, q) * inverse_determinant;
     if (t <= EPSILON) {
         return false;
     }
