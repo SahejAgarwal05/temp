@@ -46,6 +46,7 @@ struct GPUTriangle {
     Vec3 normal;
     Vec3 highCorner;
     Vec3 lowCorner;
+    Vec3 p0;
     __host__ __device__ GPUTriangle() = default;
     __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle2):
         object_index(object_index), triangle_index(triangle_index) {
@@ -57,6 +58,7 @@ struct GPUTriangle {
                             fminf(triangle2.p0.z, fminf(triangle2.p1.z, triangle2.p2.z)));
             edge0 = triangle2.p1 - triangle2.p0;
             edge1 = triangle2.p2 - triangle2.p0;
+            p0 = triangle2.p0;
             normal = normalize(cross(edge0, edge1));
         }
 };
