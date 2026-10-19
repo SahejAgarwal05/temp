@@ -160,13 +160,11 @@ __global__ void buildBVHSubtree(
     unsigned long long* best, int first_node, int second_node)
 {
     if (threadIdx.x == 0) nodes[first_node] = LeafNode(n_triangles);
-    __syncthreads();
     // Preorder guarantees parents are initialized before their children.
     // A single cooperating block avoids device-side recursive launches and
     // their extra compiler/linker requirements on the server.
     for (int index = first_node; index < n_nodes; ++index) {
         splitNode(n_triangles, n_nodes, triangles, deltas, best + index, index, nodes);
-        __syncthreads();
     }
 }
 
@@ -224,6 +222,16 @@ __global__ void convertToGPUTriagles(int n_triangles, unsigned long long* morton
     gpu_triangles[idx] = GPUTriangle(object_indices[idx], idx, triangles[idx]);
     morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, fullSpace);
 }
+// Copy each triangle once into its position in the sorted Morton order.
+__global__ void reorderTrianglesByMorton(int triangle_count, const unsigned long long* sorted_keys,
+                                         const GPUTriangle* original_triangles,
+                                         GPUTriangle* sorted_triangles) {
+    const int sorted_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sorted_index >= triangle_count) return;
+    const int original_index = static_cast<int>(sorted_keys[sorted_index] & IDX_MASK);
+    sorted_triangles[sorted_index] = original_triangles[original_index];
+}
+
 // Slab intersection, including rays parallel to a face of the box.
 __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest, float& entry_distance) {
     // Triangle intersection and slab division can round the same distance
@@ -458,6 +466,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     // 2. Declare GPU pointers
     Triangle* gpu_raw_triangles = nullptr;
     GPUTriangle* gpu_triangles = nullptr;
+    GPUTriangle* gpu_sorted_triangles = nullptr;
     LeafNode* gpu_nodes = nullptr;
     ObjectMaterial* gpu_materials = nullptr;
     int* gpu_triangle_object_indices = nullptr;
@@ -471,6 +480,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaFree(gpu_raw_triangles);
         cudaFree(gpu_triangle_object_indices);
         cudaFree(gpu_triangles);
+        cudaFree(gpu_sorted_triangles);
         cudaFree(gpu_materials);
         cudaFree(gpu_nodes);
         cudaFree(mortonCodes);
@@ -533,13 +543,14 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         gpu_triangle_object_indices = nullptr;
 
 
-        // 9. Sort tr/angles by Morton codes
-        thrust::sort_by_key(
-            thrust::device,
-            mortonCodes,
-            mortonCodes + triangle_count,
-            gpu_triangles
-        );
+        // 9. Sort small Morton keys, then reorder the full triangles once.
+        thrust::sort(thrust::device, mortonCodes, mortonCodes + triangle_count);
+        cudaMalloc(&gpu_sorted_triangles, triangle_count * sizeof(GPUTriangle));
+        reorderTrianglesByMorton<<<(triangle_count + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            triangle_count, mortonCodes, gpu_triangles, gpu_sorted_triangles);
+        cudaFree(gpu_triangles);
+        gpu_triangles = gpu_sorted_triangles;
+        gpu_sorted_triangles = nullptr;
 
 
         // 10. Calculate Morton code deltas
