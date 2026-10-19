@@ -245,7 +245,6 @@ __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
 
 __device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    static_assert(MAX_LEAF_SIZE == 2, "The two explicit tests require two-triangle leaves");
     if (leaf.n > 0)
         testTriangleHit(ray, triangles[leaf.startIndex], previous_triangle, hit);
     if (leaf.n > 1)
@@ -267,7 +266,9 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
         // Recheck deferred nodes against any closer hit found in the meantime.
         if (intersectNode(ray, node, hit.record.t, entry_distance)) {
             if (node.rightNodeIndex == -1) {
-                testLeafTriangles(ray, triangles, node, previous_triangle, hit);
+                testTriangleHit(ray, triangles[node.startIndex], previous_triangle, hit);
+                if (node.n > 1)
+                    testTriangleHit(ray, triangles[node.startIndex + 1], previous_triangle, hit);
             } else {
                 const int left_child = node_index + 1;
                 const int right_child = node.rightNodeIndex;
