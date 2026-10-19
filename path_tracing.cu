@@ -174,12 +174,11 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n, const bool is_leaf, int node_index) {
+__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {
     NodeBox box;
     for (int i = startIndex; i < startIndex + n; ++i) {
         box.insert(triangles[i].lowCorner);
         box.insert(triangles[i].highCorner);
-        if (is_leaf) triangles[i].node_index = node_index;
     }
     box.pad();
     return box;
@@ -188,8 +187,7 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, con
 __global__ void buildBVHBounds(int node_count, LeafNode* nodes, GPUTriangle* triangles) {
     const int node_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (node_index >= node_count) return;
-    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n,
-                                   nodes[node_index].rightNodeIndex == -1, node_index);
+    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n,);
     nodes[node_index].lowCorner = box.lowCorner;
     nodes[node_index].highCorner = box.highCorner;
 }
