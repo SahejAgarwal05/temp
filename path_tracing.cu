@@ -84,12 +84,6 @@ struct NodeBox {
     }
 };
 
-void checkCuda(cudaError_t result) {
-    if (result != cudaSuccess)
-        throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(result));
-}
-
-
 __host__ __device__ inline int countNodes(int n) {
     if (n == 0) return 0;
     const int leaves = n / MAX_LEAF_SIZE + (n % MAX_LEAF_SIZE != 0);
@@ -384,40 +378,35 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaFree(deltas);
         cudaFree(gpu_pixels);
     };
-    try {
+    cudaMalloc(&gpu_raw_triangles, n_triangles * sizeof(Triangle));
+    cudaMalloc(&gpu_triangle_object_indices, n_triangles * sizeof(int));
+    cudaMalloc(&gpu_triangles, n_triangles * sizeof(GPUTriangle));
+    cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial));
+    cudaMalloc(&gpu_nodes, n_nodes * sizeof(LeafNode));
+    cudaMalloc(&mortonCodes, n_triangles * sizeof(unsigned long));
+    cudaMalloc(&deltas, n_triangles * sizeof(unsigned long));
 
 
-        // 3. Allocate GPU memory
-        checkCuda(cudaMalloc(&gpu_raw_triangles, n_triangles * sizeof(Triangle)));
-        checkCuda(cudaMalloc(&gpu_triangle_object_indices, n_triangles * sizeof(int)));
-        checkCuda(cudaMalloc(&gpu_triangles, n_triangles * sizeof(GPUTriangle)));
-        checkCuda(cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial)));
-        checkCuda(cudaMalloc(&gpu_nodes, n_nodes * sizeof(LeafNode)));
-        checkCuda(cudaMalloc(&mortonCodes, n_triangles * sizeof(unsigned long)));
-        checkCuda(cudaMalloc(&deltas, n_triangles * sizeof(unsigned long)));
-
-
-        // 4. Copy CPU data to GPU
-        checkCuda(cudaMemcpy(
+        cudaMemcpy(
             gpu_raw_triangles,
             triangles.data(),
             n_triangles * sizeof(Triangle),
             cudaMemcpyHostToDevice
-        ));
+        );
 
-        checkCuda(cudaMemcpy(
+        cudaMemcpy(
             gpu_triangle_object_indices,
             triangle_object_indices.data(),
             n_triangles * sizeof(int),
             cudaMemcpyHostToDevice
-        ));
+        );
 
-        checkCuda(cudaMemcpy(
+        cudaMemcpy(
             gpu_materials,
             materials.data(),
             objects.size() * sizeof(ObjectMaterial),
             cudaMemcpyHostToDevice
-        ));
+        );
 
 
         // 5. Convert triangles into GPU triangle structures
@@ -435,11 +424,10 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
 
 
         // 6. Free temporary GPU arrays
-        checkCuda(cudaGetLastError());
-        checkCuda(cudaDeviceSynchronize());
-        checkCuda(cudaFree(gpu_raw_triangles));
+   
+        cudaFree(gpu_raw_triangles);
         gpu_raw_triangles = nullptr;
-        checkCuda(cudaFree(gpu_triangle_object_indices));
+        cudaFree(gpu_triangle_object_indices);
         gpu_triangle_object_indices = nullptr;
 
 
@@ -452,12 +440,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
             n_triangles,
             gpu_nodes
         );
-
-
-        // 8. Generate Morton codes
-        checkCuda(cudaGetLastError());
-
-
         // 9. Sort triangles by Morton codes
         thrust::sort_by_key(
             thrust::device,
@@ -479,7 +461,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
 
 
         // 11. Build BVH
-        checkCuda(cudaGetLastError());
         buildBVH(
             n_nodes,
             n_triangles,
@@ -489,16 +470,11 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         );
 
         // 12. Trace samples, average subpixels, and return the final image.
-        checkCuda(cudaMalloc(&gpu_pixels, n_pixels * sizeof(Pixel)));
+        cudaMalloc(&gpu_pixels, n_pixels * sizeof(Pixel));
         renderPixels<<<unsigned((n_pixels + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
             settings, gpu_triangles, gpu_nodes, n_nodes, gpu_materials, gpu_pixels, n_pixels);
-        checkCuda(cudaGetLastError());
         std::vector<Pixel> pixels(n_pixels);
-        checkCuda(cudaMemcpy(pixels.data(), gpu_pixels, n_pixels * sizeof(Pixel), cudaMemcpyDeviceToHost));
+        cudaMemcpy(pixels.data(), gpu_pixels, n_pixels * sizeof(Pixel), cudaMemcpyDeviceToHost);
         release();
         return pixels;
-    } catch (...) {
-        release();
-        throw;
-    }
 }
