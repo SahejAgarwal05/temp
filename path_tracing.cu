@@ -289,15 +289,13 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                 const bool hit_right = intersectNode(ray, nodes[right_child], hit.record.t, right_entry);
 
                 if (hit_left && hit_right) {
-                    if (pending_count == STACK_CAPACITY)
-                        return closestHitInOrder(ray, triangles, nodes, n_nodes, previous_triangle);
                     const bool left_is_nearer = left_entry <= right_entry;
                     // Save the farther child and immediately descend into the nearer one.
                     pending_nodes[pending_count++] = left_is_nearer ? right_child : left_child;
                     node_index = left_is_nearer ? left_child : right_child;
                     continue;
                 }
-                if (hit_left || hit_right) {
+                elseif (hit_left || hit_right) {
                     node_index = hit_left ? left_child : right_child;
                     continue;
                 }
