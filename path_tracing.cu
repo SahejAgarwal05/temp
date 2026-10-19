@@ -317,15 +317,24 @@ __global__ void traceSubpixelSamples(RenderSettings settings, const GPUTriangle*
     RandomGPU random(path_sample_index);
     const Vec3 sample_color = tracePath(Ray{}, settings, triangles, nodes, bvh_node_count,materials, random, &subpixel_first_hits[subpixel_index]);
 
-    atomicAdd(subpixl_radiance_same + subpixel_index, sample_color);
+    atomicAdd(&subpixel_radiance_sums[subpixel_index].x, sample_color.x);
+    atomicAdd(&subpixel_radiance_sums[subpixel_index].y, sample_color.y);
+    atomicAdd(&subpixel_radiance_sums[subpixel_index].z, sample_color.z);
 }
 
 __global__ void averageSubpixelSamples(RenderSettings settings, const Vec3* subpixel_radiance_sums,
                                        Vec3* pixel_radiance_sums, size_t subpixel_count) {
     const size_t subpixel_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (subpixel_index >= subpixel_count) return;
-    size_t pixel_index = subpixel_index / (settings.supersampling_factor * settings.supersampling_factor);
-    atomicAdd(pixel_radiance_sums + pixel_index, subpixel_radiance_sums[subpixel_index]);
+    const size_t subpixels_per_axis = settings.supersampling_factor;
+    const size_t subpixel_grid_width = size_t(settings.width) * subpixels_per_axis;
+    const size_t pixel_x = (subpixel_index % subpixel_grid_width) / subpixels_per_axis;
+    const size_t pixel_y = (subpixel_index / subpixel_grid_width) / subpixels_per_axis;
+    const size_t pixel_index = pixel_y * settings.width + pixel_x;
+    const Vec3 subpixel_color = subpixel_radiance_sums[subpixel_index] / float(settings.samples_per_pixel);
+    atomicAdd(&pixel_radiance_sums[pixel_index].x, subpixel_color.x);
+    atomicAdd(&pixel_radiance_sums[pixel_index].y, subpixel_color.y);
+    atomicAdd(&pixel_radiance_sums[pixel_index].z, subpixel_color.z);
 }
 
 __global__ void finalizeOutputPixels(RenderSettings settings, const Vec3* pixel_radiance_sums,
@@ -495,7 +504,8 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaMalloc(&gpu_subpixel_first_hits, subpixel_count * sizeof(Hit));
         const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
         findSubpixelFirstHits<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits, subpixel_count);
+            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits,
+            subpixel_count, subpixel_grid_width);
         const size_t path_sample_count = subpixel_count * samples_per_subpixel;
         traceSubpixelSamples<<<unsigned((path_sample_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
             settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_materials, gpu_subpixel_radiance_sums,
