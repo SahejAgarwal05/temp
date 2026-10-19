@@ -235,38 +235,19 @@ __device__ void atomicMin(Hit* hit, const Hit& new_hit) {
         *hit = new_hit;
     }
 }
-__device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
+__global__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    int idx = leaf.startIndex + threadIdx.x + blockIdx.x * blockDim.x;
-    Hit local_hit;
-    if (idx < leaf.startIndex + leaf.n) {
-        const GPUTriangle& triangle = triangles[idx];
-        if (idx != previous_triangle) {
-            local_hit.record = intersect_triangle(ray, triangle.triangle);
-            atomicMin(&hit, local_hit);
-        }
+    
+    Hit hit1, hit2;
+    intersect_triangle(ray, triangles[leaf.startIndex], previous_triangle, hit1);
+    intersect_triangle(ray, triangles[leaf.startIndex + 1], previous_triangle, hit2);
+    if(hit1.record.t <hit.record.t) {
+        hit = hit1;
+        return;
     }
-    __syncthreads();
-
+    hit = hit2;
 }
 
-// Fall back to the original traversal if an unusually deep tree fills the stack.
-__device__ Hit closestHitInOrder(const Ray& ray, const GPUTriangle* triangles,
-                                 const LeafNode* nodes, int node_count, int previous_triangle) {
-    Hit hit;
-    for (int node_index = 0; node_index < node_count;) {
-        const LeafNode& node = nodes[node_index];
-        float entry_distance;
-        if (!intersectNode(ray, node, hit.record.t, entry_distance)) {
-            node_index += countNodes(node.n);
-            continue;
-        }
-        if (node.rightNodeIndex == -1)
-            testLeafTriangles(ray, triangles, node, previous_triangle, hit);
-        ++node_index;
-    }
-    return hit;
-}
 
 __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                           const LeafNode* nodes, int n_nodes, int previous_triangle) {
