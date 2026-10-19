@@ -39,12 +39,11 @@ struct LeafNode {
 };
 
 struct GPUTriangle {
-    Triangle triangle;
     int object_index;
     int triangle_index; // Original flattened ID, preserved through sorting.
-    Vec3 edge0 = triangle.p1 - triangle.p0;
-    Vec3 edge1 = triangle.p2 - triangle.p0;
-    Vec3 normal = normalize(cross(edge0, edge1));
+    Vec3 edge0;
+    Vec3 edge1;
+    Vec3 normal;
     Vec3 highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
                            fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
                            fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
@@ -53,7 +52,7 @@ struct GPUTriangle {
                           fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
     __host__ __device__ GPUTriangle() = default;
     __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle):
-        triangle(triangle), object_index(object_index), triangle_index(triangle_index) {
+        object_index(object_index), triangle_index(triangle_index) {
             highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
                              fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
                              fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
