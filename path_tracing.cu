@@ -180,39 +180,35 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__global__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* triangles, const unsigned long* deltas, unsigned long* best, int node_index, LeafNode* nodes) {
-    const int i = (threadIdx.x + blockIdx.x * blockDim.x) + nodes[node_index].startIndex + 1;
-    if (nodes[node_index].n <= MAX_LEAF_SIZE || i > nodes[node_index].startIndex + nodes[node_index].n - 2){
-        
-    } else {
-        atomicMax(best, deltas[i]);
+__device__ void calcNodeBox(int n_triangles, GPUTriangle* triangles, int start,
+                            int end, Vec3* lowCorner, Vec3* highCorner,
+                            int node_index, bool write_idx) {
+    __shared__ float lows[BLOCK_SIZE][3], highs[BLOCK_SIZE][3];
+    const int t = threadIdx.x;
+    NodeBox box;
+    for (int idx = start + t; idx < end; idx += blockDim.x) {
+        box.insert(triangles[idx].lowCorner);
+        box.insert(triangles[idx].highCorner);
+        if (write_idx) triangles[idx].node_index = node_index;
     }
+    lows[t][0] = box.lowCorner.x; lows[t][1] = box.lowCorner.y; lows[t][2] = box.lowCorner.z;
+    highs[t][0] = box.highCorner.x; highs[t][1] = box.highCorner.y; highs[t][2] = box.highCorner.z;
     __syncthreads();
-    if (nodes[node_index].n <= MAX_LEAF_SIZE || i > nodes[node_index].startIndex + nodes[node_index].n - 2){
-    } else {
-        if (deltas[i] == *best) {
-            atomicMin(best, static_cast<unsigned long>(i));
+    for (int offset = blockDim.x / 2; offset; offset /= 2) {
+        if (t < offset) {
+            for (int axis = 0; axis < 3; ++axis) {
+                lows[t][axis] = fminf(lows[t][axis], lows[t + offset][axis]);
+                highs[t][axis] = fmaxf(highs[t][axis], highs[t + offset][axis]);
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
-    if(threadIdx.x == 0 && blockIdx.x == 0){
-        const unsigned long key = *best;
-        if (key == 0) return; 
-        const int start = nodes[node_index].startIndex; 
-        const int n = nodes[node_index].n;                                    // no valid split
-        const int split = static_cast<int>(IDX_MASK - (key & IDX_MASK));
-        const int left_n = split + 1 - start;
-        const int left = node_index + 1;
-        const int right = left + countNodes(left_n);
-        nodes[node_index].rightNodeIndex = right;
-        nodes[left].rightNodeIndex = -1;
-        nodes[left].n = left_n;
-        nodes[left].startIndex = start;
-        nodes[left].parent_id = node_index;
-        nodes[right].rightNodeIndex = -1;
-        nodes[right].n = n - left_n;
-        nodes[right].startIndex = start + left_n;
-        nodes[right].parent_id = node_index;
+    if (t == 0) {
+        box.lowCorner = Vec3(lows[0][0], lows[0][1], lows[0][2]);
+        box.highCorner = Vec3(highs[0][0], highs[0][1], highs[0][2]);
+        box.pad();
+        *lowCorner = box.lowCorner;
+        *highCorner = box.highCorner;
     }
 }
 
