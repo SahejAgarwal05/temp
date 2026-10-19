@@ -44,21 +44,17 @@ struct GPUTriangle {
     Vec3 edge0;
     Vec3 edge1;
     Vec3 normal;
-    Vec3 highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
-                           fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
-                           fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
-    Vec3 lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
-                          fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
-                          fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+    Vec3 highCorner;
+    Vec3 lowCorner;
     __host__ __device__ GPUTriangle() = default;
     __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle2):
         object_index(object_index), triangle_index(triangle_index) {
-            highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
-                             fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
-                             fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
-            lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
-                            fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
-                            fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+            highCorner = Vec3(fmaxf(triangle2.p0.x, fmaxf(triangle2.p1.x, triangle2.p2.x)),
+                             fmaxf(triangle2.p0.y, fmaxf(triangle2.p1.y, triangle2.p2.y)),
+                             fmaxf(triangle2.p0.z, fmaxf(triangle2.p1.z, triangle2.p2.z)));
+            lowCorner = Vec3(fminf(triangle2.p0.x, fminf(triangle2.p1.x, triangle2.p2.x)),
+                            fminf(triangle2.p0.y, fminf(triangle2.p1.y, triangle2.p2.y)),
+                            fminf(triangle2.p0.z, fminf(triangle2.p1.z, triangle2.p2.z)));
             edge0 = triangle2.p1 - triangle2.p0;
             edge1 = triangle2.p2 - triangle2.p0;
             normal = normalize(cross(edge0, edge1));
