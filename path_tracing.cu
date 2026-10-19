@@ -337,7 +337,7 @@ __global__ void traceSubpixelSamples(RenderSettings settings, const GPUTriangle*
     RandomGPU random(path_sample_index);
     const Vec3 sample_color = tracePath(Ray{}, settings, triangles, nodes, bvh_node_count,materials, random, &subpixel_first_hits[subpixel_index]);
 
-    atomicAdd(subpixl_radiance_same + subpixel_index, sample_color);
+    atomicAdd(subpixel_radiance_sums + subpixel_index, sample_color);
 }
 
 __global__ void averageSubpixelSamples(RenderSettings settings, const Vec3* subpixel_radiance_sums,
