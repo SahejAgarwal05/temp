@@ -183,7 +183,7 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, con
 
 
 // Call after Morton sorting and calcDelta. The builder initializes its own nodes.
-__device__ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
+void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes, const unsigned long long* deltas) {
     if (n_nodes == 0) return;
     unsigned long long* best = nullptr;
