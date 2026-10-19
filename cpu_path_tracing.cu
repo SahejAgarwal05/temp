@@ -10,7 +10,7 @@
 
 constexpr int MAX_LEAF_SIZE = 2;
 constexpr int BLOCK_SIZE = 256;
-constexpr unsigned long long IDX_MASK = 0xffffffffULL;
+constexpr unsigned long IDX_MASK = 0xffffffffULL;
 using namespace std;
 struct Hit {
     HitRecord record;
@@ -101,32 +101,28 @@ __device__ inline unsigned gridLocation(float value, float low, float high) {
         ? unsigned(fminf(1023.f, fmaxf(0.f, (value - low) / (high - low) * 1024.f))) : 0;
 }
 
-__global__ void mortonEncoding(int n, const GPUTriangle* triangles,
-                               unsigned long long* mortonCodes, NodeBox fullSpace) {
-    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= n) return;
-    NodeBox box;
-    box.insert(triangles[idx].triangle);
-    const Vec3 center = box.lowCorner * 0.5f + box.highCorner * 0.5f;
+ unsigned long mortonEncoding(int idx, const GPUTriangle triangle,
+                               unsigned long* mortonCodes, NodeBox fullSpace) {
+    const Vec3 center = triangle.lowCorner * 0.5f + triangle.highCorner * 0.5f;
     const unsigned x = gridLocation(center.x, fullSpace.lowCorner.x, fullSpace.highCorner.x);
     const unsigned y = gridLocation(center.y, fullSpace.lowCorner.y, fullSpace.highCorner.y);
     const unsigned z = gridLocation(center.z, fullSpace.lowCorner.z, fullSpace.highCorner.z);
-    unsigned long long morton = 0;
+    unsigned long morton = 0;
     for (int i = 0; i < 10; ++i) {
-        morton |= static_cast<unsigned long long>((x >> i) & 1) << (3 * i + 2);
-        morton |= static_cast<unsigned long long>((y >> i) & 1) << (3 * i + 1);
-        morton |= static_cast<unsigned long long>((z >> i) & 1) << (3 * i);
+        morton |= static_cast<unsigned long>((x >> i) & 1) << (3 * i + 2);
+        morton |= static_cast<unsigned long>((y >> i) & 1) << (3 * i + 1);
+        morton |= static_cast<unsigned long>((z >> i) & 1) << (3 * i);
     }
     // Thirty spatial bits plus a unique 32-bit ID fit in a 64-bit key.
-    mortonCodes[idx] = (morton << 32) | static_cast<unsigned long long>(idx);
+    return (morton << 32) | static_cast<unsigned long>(idx);
 }
 
-__global__ void calcDelta(int n, const unsigned long long* mortonCodes, unsigned long long* deltas) {
+__global__ void calcDelta(int n, const unsigned long* mortonCodes, unsigned long* deltas) {
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= n - 1) return;
-    const unsigned long long difference = mortonCodes[idx] ^ mortonCodes[idx + 1];
-    const unsigned long long rank = static_cast<unsigned long long>(64 - __clzll(difference));
-    deltas[idx] = (rank << 32) | (IDX_MASK - static_cast<unsigned long long>(idx));
+    const unsigned long difference = mortonCodes[idx] ^ mortonCodes[idx + 1];
+    const unsigned long rank = static_cast<unsigned long>(64 - __clzll(difference));
+    deltas[idx] = (rank << 32) | (IDX_MASK - static_cast<unsigned long>(idx));
 }
 
 __global__ void initNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
@@ -141,13 +137,13 @@ __global__ void initNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
 // One block finds a split between whole leaf groups. The low key bits already
 // break ties, so the winning key must stay intact until its index is decoded.
 __device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* triangles,
-                          const unsigned long long* deltas, unsigned long long* best,
+                          const unsigned long* deltas, unsigned long* best,
                           int node_index, LeafNode* nodes) {
     const int start = nodes[node_index].startIndex;
     const int n = nodes[node_index].n;
     if (n <= MAX_LEAF_SIZE) return;
-    __shared__ unsigned long long keys[BLOCK_SIZE];
-    unsigned long long key = 0;
+    __shared__ unsigned long keys[BLOCK_SIZE];
+    unsigned long key = 0;
     for (int i = start + MAX_LEAF_SIZE - 1 + threadIdx.x * MAX_LEAF_SIZE;
          i < start + n - 1; i += blockDim.x * MAX_LEAF_SIZE) {
         if (deltas[i] > key) key = deltas[i];
@@ -178,8 +174,8 @@ __device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* trian
 
 __global__ void buildBVHSubtree(
     int n_triangles, int n_nodes, GPUTriangle* triangles,
-    const unsigned long long* deltas, LeafNode* nodes,
-    unsigned long long* best, int first_node, int second_node)
+    const unsigned long* deltas, LeafNode* nodes,
+    unsigned long* best, int first_node, int second_node)
 {
     // Preorder guarantees parents are initialized before their children.
     // A single cooperating block avoids device-side recursive launches and
@@ -233,10 +229,10 @@ __global__ void buildBVHBounds(int n_nodes, LeafNode* nodes, GPUTriangle* triang
 
 // Call after initNodes, Morton sorting, and calcDelta.
 void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
-              LeafNode* gpu_nodes, const unsigned long long* deltas) {
+              LeafNode* gpu_nodes, const unsigned long* deltas) {
     if (n_nodes == 0) return;
-    unsigned long long* best = nullptr;
-    checkCuda(cudaMalloc(&best, n_nodes * sizeof(unsigned long long)));
+    unsigned long* best = nullptr;
+    checkCuda(cudaMalloc(&best, n_nodes * sizeof(unsigned long)));
     try {
         buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
                                            deltas, gpu_nodes, best, 0, -1);
@@ -252,10 +248,11 @@ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
     checkCuda(cudaFree(best));
 }
 
-__global__ void convertToGPUTriagles(int n_triangles, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices) {
+__global__ void convertToGPUTriagles(int n_triangles, unsigned long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices) {
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= n_triangles) return;
     gpu_triangles[idx] = GPUTriangle(object_indices[idx], idx, triangles[idx]);
+    morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, NodeBox());
 }
 // Slab intersection, including rays parallel to a face of the box.
 __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest) {
@@ -381,10 +378,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         }
     }
 
-    if (triangles.empty())
-        return std::vector<Pixel>(n_pixels, to_pixel(settings.background_light));
-    if (triangles.size() > size_t(std::numeric_limits<int>::max()))
-        throw std::overflow_error("Too many triangles");
     int n_triangles = static_cast<int>(triangles.size());
     int n_nodes = countNodes(n_triangles);
 
@@ -395,8 +388,8 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     LeafNode* gpu_nodes = nullptr;
     ObjectMaterial* gpu_materials = nullptr;
     int* gpu_triangle_object_indices = nullptr;
-    unsigned long long* mortonCodes = nullptr;
-    unsigned long long* deltas = nullptr;
+    unsigned long* mortonCodes = nullptr;
+    unsigned long* deltas = nullptr;
     Pixel* gpu_pixels = nullptr;
     auto release = [&]() {
         cudaFree(gpu_raw_triangles);
@@ -417,8 +410,8 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         checkCuda(cudaMalloc(&gpu_triangles, n_triangles * sizeof(GPUTriangle)));
         checkCuda(cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial)));
         checkCuda(cudaMalloc(&gpu_nodes, n_nodes * sizeof(LeafNode)));
-        checkCuda(cudaMalloc(&mortonCodes, n_triangles * sizeof(unsigned long long)));
-        checkCuda(cudaMalloc(&deltas, n_triangles * sizeof(unsigned long long)));
+        checkCuda(cudaMalloc(&mortonCodes, n_triangles * sizeof(unsigned long)));
+        checkCuda(cudaMalloc(&deltas, n_triangles * sizeof(unsigned long)));
 
 
         // 4. Copy CPU data to GPU
@@ -451,6 +444,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         >>>(
             n_triangles,
             gpu_raw_triangles,
+            mortonCodes,
             gpu_triangles,
             gpu_triangle_object_indices
         );
@@ -477,9 +471,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
 
 
         // 8. Generate Morton codes
-        checkCuda(cudaGetLastError());
-        mortonEncoding<<<(n_triangles + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-            n_triangles, gpu_triangles, mortonCodes, fullSpace);
         checkCuda(cudaGetLastError());
 
 
