@@ -33,6 +33,9 @@ struct LeafNode {
     int n;
     int startIndex;
     int parent_id;
+
+    __host__ __device__ LeafNode(int triangle_count = 0, int first_triangle = 0, int parent = -1)
+        : rightNodeIndex(-1), n(triangle_count), startIndex(first_triangle), parent_id(parent) {}
 };
 
 struct GPUTriangle {
@@ -119,15 +122,6 @@ __global__ void calcDelta(int n, const unsigned long long* mortonCodes, unsigned
     deltas[idx] = (rank << 32) | (IDX_MASK - static_cast<unsigned long long>(idx));
 }
 
-__global__ void initNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
-    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= n_nodes) return;
-    nodes[idx].rightNodeIndex = -1;
-    nodes[idx].n = idx == 0 ? n_triangles : 0;
-    nodes[idx].startIndex = 0;
-    nodes[idx].parent_id = -1;
-}
-
 // One block finds a split between whole leaf groups. The low key bits already
 // break ties, so the winning key must stay intact until its index is decoded.
 __device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* triangles,
@@ -152,12 +146,8 @@ __device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* trian
         const int left = node_index + 1;
         const int right = left + countNodes(left_n);
         nodes[node_index].rightNodeIndex = right;
-        nodes[left].n = left_n;
-        nodes[left].startIndex = start;
-        nodes[left].parent_id = node_index;
-        nodes[right].n = n - left_n;
-        nodes[right].startIndex = start + left_n;
-        nodes[right].parent_id = node_index;
+        nodes[left] = LeafNode(left_n, start, node_index);
+        nodes[right] = LeafNode(n - left_n, start + left_n, node_index);
     }
     __syncthreads();
 }
@@ -167,6 +157,8 @@ __global__ void buildBVHSubtree(
     const unsigned long long* deltas, LeafNode* nodes,
     unsigned long long* best, int first_node, int second_node)
 {
+    if (threadIdx.x == 0) nodes[first_node] = LeafNode(n_triangles);
+    __syncthreads();
     // Preorder guarantees parents are initialized before their children.
     // A single cooperating block avoids device-side recursive launches and
     // their extra compiler/linker requirements on the server.
@@ -176,10 +168,9 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const LeafNode& node, int node_index) {
+__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n, const bool is_leaf, int node_index) {
     NodeBox box;
-    const bool is_leaf = node.rightNodeIndex == -1;
-    for (int i = node.startIndex; i < node.startIndex + node.n; ++i) {
+    for (int i = startIndex; i < startIndex + n; ++i) {
         box.insert(triangles[i].lowCorner);
         box.insert(triangles[i].highCorner);
         if (is_leaf) triangles[i].node_index = node_index;
@@ -191,12 +182,13 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const LeafNode& node, int
 __global__ void buildBVHBounds(int node_count, LeafNode* nodes, GPUTriangle* triangles) {
     const int node_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (node_index >= node_count) return;
-    const NodeBox box = calcNodeBox(triangles, nodes[node_index], node_index);
+    const NodeBox box = calcNodeBox(triangles, nodes[node_index].startIndex, nodes[node_index].n,
+                                   nodes[node_index].rightNodeIndex == -1, node_index);
     nodes[node_index].lowCorner = box.lowCorner;
     nodes[node_index].highCorner = box.highCorner;
 }
 
-// Call after initNodes, Morton sorting, and calcDelta.
+// Call after Morton sorting and calcDelta. The builder initializes its own nodes.
 void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes, const unsigned long long* deltas) {
     if (n_nodes == 0) return;
@@ -271,13 +263,13 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
                           const GPUTriangle* triangles, const LeafNode* nodes,
                           int n_nodes, const ObjectMaterial* materials, RandomGPU& random,
                           const Hit* first_hit = nullptr) {
-    Vec3 light, throughput(1.0f, 1.0f, 1.0f);
+    Vec3 light, throughput(1.0f, 1.0f, 1.0f), zero(0,0,0);
     int previous_triangle = -1;
     for (int bounce = 0; ; ++bounce) {
         // All samples of a subpixel share the deterministic camera intersection.
         const Hit hit = bounce == 0 && first_hit != nullptr
             ? *first_hit : closestHit(ray, triangles, nodes, n_nodes, previous_triangle);
-        if (!hit.hit()) {
+        if (!hit.hit() || length(throughout - zero) < EPSILON) {
             light += multiply(throughput, settings.background_light);
             break;
         }
@@ -456,16 +448,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         gpu_triangle_object_indices = nullptr;
 
 
-        // 7. Initialize BVH nodes
-        initNodes<<<
-            (bvh_node_count + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE
-        >>>(
-            bvh_node_count,
-            triangle_count,
-            gpu_nodes
-        );
-        // 9. Sort triangles by Morton codes
+        // 9. Sort tr/angles by Morton codes
         thrust::sort_by_key(
             thrust::device,
             mortonCodes,
