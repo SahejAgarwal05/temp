@@ -170,7 +170,7 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {)
+__device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, const int n) {
     NodeBox box;
     for (int i = startIndex; i < startIndex + n; ++i) {
         box.insert(triangles[i].lowCorner);
@@ -182,14 +182,9 @@ __device__ NodeBox calcNodeBox(GPUTriangle* triangles, const int startIndex, con
 
 
 
-// Call after Morton sorting and calcDelta. The builder initializes its own nodes.
-void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
-              LeafNode* gpu_nodes, const unsigned long long* deltas) {
-    if (n_nodes == 0) return;
-    unsigned long long* best = nullptr;
-    cudaMalloc(&best, n_nodes * sizeof(unsigned long long));
-    buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
-                                           deltas, gpu_nodes, best, 0, -1);
+__global__ void buildBVHBounds(int n_nodes, LeafNode* gpu_nodes, GPUTriangle* gpu_triangles) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    // Reverse preorder ensures both child boxes are ready before their parent.
     for(int i = n_nodes - 1; i >= 0; --i) {
         if(gpu_nodes[i].rightNodeIndex == -1) {
             // Leaf node
@@ -209,6 +204,17 @@ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
             gpu_nodes[i].highCorner = box.highCorner;
         }
     }
+}
+
+// Call after Morton sorting and calcDelta. The builder initializes its own nodes.
+void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
+              LeafNode* gpu_nodes, const unsigned long long* deltas) {
+    if (n_nodes == 0) return;
+    unsigned long long* best = nullptr;
+    cudaMalloc(&best, n_nodes * sizeof(unsigned long long));
+    buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
+                                           deltas, gpu_nodes, best, 0, -1);
+    buildBVHBounds<<<1, 1>>>(n_nodes, gpu_nodes, gpu_triangles);
     cudaFree(best);
 }
 
