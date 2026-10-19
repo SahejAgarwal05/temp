@@ -230,21 +230,24 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
-// Each CUDA thread traces its own ray and checks every triangle in its leaf.
+__device__ void atomicMin(Hit* hit, const Hit& new_hit) {
+    if (new_hit.record.t < hit->record.t) {
+        *hit = new_hit;
+    }
+}
 __device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
                                   const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    for (int i = leaf.startIndex; i < leaf.startIndex + leaf.n; ++i) {
-        const GPUTriangle& triangle = triangles[i];
-        if (triangle.triangle_index == previous_triangle) continue;
-        HitRecord record;
-        if (intersect_triangle(ray, triangle.triangle, &record) &&
-            (record.t < hit.record.t ||
-             (record.t == hit.record.t && triangle.triangle_index < hit.triangle_index))) {
-            hit.record = record;
-            hit.object_index = triangle.object_index;
-            hit.triangle_index = triangle.triangle_index;
+    int idx = leaf.startIndex + threadIdx.x + blockIdx.x * blockDim.x;
+    Hit local_hit;
+    if (idx < leaf.startIndex + leaf.n) {
+        const GPUTriangle& triangle = triangles[idx];
+        if (idx != previous_triangle) {
+            local_hit.record = intersect_triangle(ray, triangle.triangle);
+            atomicMin(&hit, local_hit);
         }
     }
+    __syncthreads();
+
 }
 
 // Fall back to the original traversal if an unusually deep tree fills the stack.
