@@ -232,20 +232,10 @@ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes, const unsigned long* deltas) {
     if (n_nodes == 0) return;
     unsigned long* best = nullptr;
-    checkCuda(cudaMalloc(&best, n_nodes * sizeof(unsigned long)));
-    try {
-        buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
+    cudaMalloc(&best, n_nodes * sizeof(unsigned long));
+    buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
                                            deltas, gpu_nodes, best, 0, -1);
-        checkCuda(cudaGetLastError());
-        checkCuda(cudaDeviceSynchronize());
-        buildBVHBounds<<<n_nodes, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
-        checkCuda(cudaGetLastError());
-        checkCuda(cudaDeviceSynchronize());
-    } catch (...) {
-        cudaFree(best);
-        throw;
-    }
-    checkCuda(cudaFree(best));
+    buildBVHBounds<<<n_nodes, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
 }
 
 __global__ void convertToGPUTriagles(int n_triangles, unsigned long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
@@ -336,10 +326,7 @@ __global__ void renderPixels(RenderSettings settings, const GPUTriangle* triangl
     const int x = int(index % settings.width), y = int(index / settings.width);
     const int ss = settings.supersampling_factor;
     // Each output pixel owns its random stream and all of its subpixel samples.
-    uint32_t seed = uint32_t(index) ^ settings.seed;
-    seed ^= seed >> 16; seed *= 0x7feb352du;
-    seed ^= seed >> 15; seed *= 0x846ca68bu; seed ^= seed >> 16;
-    RandomGPU random(seed);
+    RandomGPU random(index);
     Vec3 color;
     for (int dy = 0; dy < ss; ++dy) {
         for (int dx = 0; dx < ss; ++dx) {
@@ -352,10 +339,6 @@ __global__ void renderPixels(RenderSettings settings, const GPUTriangle* triangl
 }
 
 std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vector<Object>& objects) {
-    if (settings.width <= 0 || settings.height <= 0 ||
-        settings.samples_per_pixel <= 0 || settings.supersampling_factor <= 0 ||
-        settings.max_bounces < 0)
-        throw std::invalid_argument("Invalid render settings");
     const size_t n_pixels = size_t(settings.width) * settings.height;
     // 1. Collect triangles and materials on CPU
     std::vector<Triangle> triangles;
