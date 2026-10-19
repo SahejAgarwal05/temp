@@ -53,7 +53,7 @@ struct GPUTriangle {
                           fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
     __host__ __device__ GPUTriangle() = default;
     __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle):
-        triangle(triangle), object_index(object_index), triangle_index(triangle_index), node_index(-1) {
+        triangle(triangle), object_index(object_index), triangle_index(triangle_index) {
             highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
                              fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
                              fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
