@@ -180,37 +180,21 @@ __global__ void buildBVHSubtree(
     }
 }
 
-__device__ void calcNodeBox(int n_triangles, GPUTriangle* triangles, int start,
-                            int end, Vec3* lowCorner, Vec3* highCorner,
-                            int node_index, bool write_idx) {
-    __shared__ float lows[BLOCK_SIZE][3], highs[BLOCK_SIZE][3];
-    const int t = threadIdx.x;
-    NodeBox box;
-    for (int idx = start + t; idx < end; idx += blockDim.x) {
-        box.insert(triangles[idx].lowCorner);
-        box.insert(triangles[idx].highCorner);
-        if (write_idx) triangles[idx].node_index = node_index;
-    }
-    lows[t][0] = box.lowCorner.x; lows[t][1] = box.lowCorner.y; lows[t][2] = box.lowCorner.z;
-    highs[t][0] = box.highCorner.x; highs[t][1] = box.highCorner.y; highs[t][2] = box.highCorner.z;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset; offset /= 2) {
-        if (t < offset) {
-            for (int axis = 0; axis < 3; ++axis) {
-                lows[t][axis] = fminf(lows[t][axis], lows[t + offset][axis]);
-                highs[t][axis] = fmaxf(highs[t][axis], highs[t + offset][axis]);
-            }
+__global__ void calcNodeBox(int n_triangles, GPUTriangle* triangles, int start, int end, Vec3* lowCorner, Vec3* highCorner, int node_index, bool write_idx){ 
+    int idx = threadIdx.x + blockIdx.x * blockDim.x + start;
+    if (idx < end){
+        atomicMin(&lowCorner->x, triangles[idx].lowCorner.x);
+        atomicMin(&lowCorner->y, triangles[idx].lowCorner.y);
+        atomicMin(&lowCorner->z, triangles[idx].lowCorner.z);
+        atomicMax(&highCorner->x, triangles[idx].highCorner.x);
+        atomicMax(&highCorner->y, triangles[idx].highCorner.y);
+        atomicMax(&highCorner->z, triangles[idx].highCorner.z);
+        if (write_idx) {
+            triangles[idx].node_index = node_index;
         }
-        __syncthreads();
-    }
-    if (t == 0) {
-        box.lowCorner = Vec3(lows[0][0], lows[0][1], lows[0][2]);
-        box.highCorner = Vec3(highs[0][0], highs[0][1], highs[0][2]);
-        box.pad();
-        *lowCorner = box.lowCorner;
-        *highCorner = box.highCorner;
     }
 }
+
 
 __global__ void buildBVHBounds(int n_nodes, LeafNode* nodes, GPUTriangle* triangles) {
     const int index = blockIdx.x;
@@ -317,10 +301,9 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
 
 __global__ void findSubpixelFirstHits(RenderSettings settings, const GPUTriangle* triangles,
                                  const LeafNode* nodes, int bvh_node_count,
-                                 Hit* subpixel_first_hits, size_t subpixel_count) {
+                                 Hit* subpixel_first_hits, size_t subpixel_count, size_t subpixel_grid_width) {
     const size_t subpixel_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (subpixel_index >= subpixel_count) return;
-    const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
     const Ray camera_ray = make_camera_ray(settings, int(subpixel_index % subpixel_grid_width),
                                            int(subpixel_index / subpixel_grid_width));
     subpixel_first_hits[subpixel_index] = closestHit(camera_ray, triangles, nodes, bvh_node_count, -1);
@@ -336,8 +319,7 @@ __global__ void traceSubpixelSamples(RenderSettings settings, const GPUTriangle*
     if (subpixel_index >= subpixel_count) return;
 
     RandomGPU random(path_sample_index);
-    const Vec3 sample_color = tracePath(Ray{}, settings, triangles, nodes, bvh_node_count,
-                                        materials, random, &subpixel_first_hits[subpixel_index]);
+    const Vec3 sample_color = tracePath(Ray{}, settings, triangles, nodes, bvh_node_count,materials, random, &subpixel_first_hits[subpixel_index]);
 
     atomicAdd(subpixl_radiance_same + subpixel_index, sample_color);
 }
@@ -346,17 +328,8 @@ __global__ void averageSubpixelSamples(RenderSettings settings, const Vec3* subp
                                        Vec3* pixel_radiance_sums, size_t subpixel_count) {
     const size_t subpixel_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (subpixel_index >= subpixel_count) return;
-    const Vec3 subpixel_color = subpixel_radiance_sums[subpixel_index] / float(settings.samples_per_pixel);
-
-    const size_t subpixels_per_axis = settings.supersampling_factor;
-    const size_t subpixel_grid_width = size_t(settings.width) * subpixels_per_axis;
-    const size_t output_pixel_x = (subpixel_index % subpixel_grid_width) / subpixels_per_axis;
-    const size_t output_pixel_y = (subpixel_index / subpixel_grid_width) / subpixels_per_axis;
-    const size_t output_pixel_index = output_pixel_y * settings.width + output_pixel_x;
-
-    atomicAdd(&pixel_radiance_sums[output_pixel_index].x, subpixel_color.x);
-    atomicAdd(&pixel_radiance_sums[output_pixel_index].y, subpixel_color.y);
-    atomicAdd(&pixel_radiance_sums[output_pixel_index].z, subpixel_color.z);
+    size_t pixel_index = subpixel_index / (settings.supersampling_factor * settings.supersampling_factor);
+    atomicAdd(pixel_radiance_sums + pixel_index, subpixel_radiance_sums[subpixel_index]);
 }
 
 __global__ void finalizeOutputPixels(RenderSettings settings, const Vec3* pixel_radiance_sums,
@@ -524,6 +497,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaMalloc(&gpu_subpixel_radiance_sums, subpixel_count * sizeof(Vec3));
         cudaMemset(gpu_subpixel_radiance_sums, 0, subpixel_count * sizeof(Vec3));
         cudaMalloc(&gpu_subpixel_first_hits, subpixel_count * sizeof(Hit));
+        const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
         findSubpixelFirstHits<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
             settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits, subpixel_count);
         const size_t path_sample_count = subpixel_count * samples_per_subpixel;
