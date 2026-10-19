@@ -43,6 +43,9 @@ struct GPUTriangle {
     int object_index;
     int triangle_index; // Original flattened ID, preserved through sorting.
     int node_index;
+    Vec3 edge0 = triangle.p1 - triangle.p0;
+    Vec3 edge1 = triangle.p2 - triangle.p0;
+    Vec3 normal = normalize(cross(edge0, edge1));
     Vec3 highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
                            fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
                            fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
@@ -58,6 +61,9 @@ struct GPUTriangle {
             lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
                             fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
                             fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+            edge0 = triangle.p1 - triangle.p0;
+            edge1 = triangle.p2 - triangle.p0;
+            normal = normalize(cross(edge0, edge1));
         }
 };
 
@@ -230,11 +236,46 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
+__device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord* record) {
+    // Implementation for GPU triangle intersection
+    const Vec3 p = cross(ray.direction, triangle.edge1);
+    const float determinant = dot(triangle.edge1, p);
+    if (std::fabs(determinant) <= EPSILON) {
+        return false;
+    }
+
+    const float inverse_determinant = 1.0 / determinant;
+    const Vec3 offset = ray.origin - triangle.p0;
+    const float u = dot(offset, p) * inverse_determinant;
+    if (u < 0.0 || u > 1.0) {
+        return false;
+    }
+
+    const Vec3 q = cross(offset, triangle.edge1);
+    const float v = dot(ray.direction, q) * inverse_determinant;
+    if (v < 0.0 || u + v > 1.0) {
+        return false;
+    }
+
+    const float t = dot(triangle.edge2, q) * inverse_determinant;
+    if (t <= EPSILON) {
+        return false;
+    }
+
+    if (dot(triangle.normal, ray.direction) > 0.0) {
+        triangle.normal = -triangle.normal;
+    }
+    record->t = t;
+    record->position = ray.origin + t * ray.direction;
+    record->unit_normal = triangle.normal;
+
+    return true;
+}
 __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
                                 int previous_triangle, Hit& closest) {
     if (triangle.triangle_index == previous_triangle) return;
     HitRecord record;
-    if (!intersect_triangle(ray, triangle.triangle, &record)) return;
+    if (!intersect_triangle_gpu(ray, triangle, &record)) return;
     if (record.t < closest.record.t ||
         (record.t == closest.record.t && triangle.triangle_index < closest.triangle_index)) {
         closest.record = record;
@@ -243,13 +284,7 @@ __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
     }
 }
 
-__device__ void testLeafTriangles(const Ray& ray, const GPUTriangle* triangles,
-                                  const LeafNode& leaf, int previous_triangle, Hit& hit) {
-    if (leaf.n > 0)
-        testTriangleHit(ray, triangles[leaf.startIndex], previous_triangle, hit);
-    if (leaf.n > 1)
-        testTriangleHit(ray, triangles[leaf.startIndex + 1], previous_triangle, hit);
-}
+
 
 __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                           const LeafNode* nodes, int n_nodes, int previous_triangle) {
