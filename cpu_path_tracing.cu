@@ -1,229 +1,529 @@
-#define MAX_LEAF_SIZE = 2;
-
 #include <cstdint>
-#include <iostream>
-
+#include <limits>
+#include <stdexcept>
+#include <string>
 
 #include "graphics.cuh"
-#include "thrust/sort.h"
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>
 
-MAX_LEAF_SIZE = 2;
+
+constexpr int MAX_LEAF_SIZE = 2;
+constexpr int BLOCK_SIZE = 256;
+constexpr unsigned long long IDX_MASK = 0xffffffffULL;
+using namespace std;
 struct Hit {
     HitRecord record;
-    int object_index;
-    int triangle_index;
-
-    Hit(): object_index(-1), triangle_index(-1) {}
-    bool hit() const { return object_index != -1; }
+    int object_index = -1;
+    int triangle_index = -1;
+    __device__ bool hit() const { return object_index != -1; }
 };
 
-
-
-struct ObjectMaterial{
+struct ObjectMaterial {
     Vec3 emission;
     Vec3 albedo;
-}
+};
 
-
-struct LeafNode{
+// Preorder layout: the left child is index + 1; rightNodeIndex == -1 marks a leaf.
+// Every range begins at a multiple of MAX_LEAF_SIZE, including internal ranges.
+struct LeafNode {
     Vec3 highCorner;
     Vec3 lowCorner;
     int rightNodeIndex;
     int n;
-    int startIndex = 0;
+    int startIndex;
     int parent_id;
-}
+};
 
-struct GPUTriangle{
+struct GPUTriangle {
     Triangle triangle;
     int object_index;
-    int triangle_index;
-    int padding;
+    int triangle_index; // Original flattened ID, preserved through sorting.
     int node_index;
-}
+    Vec3 highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
+                           fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
+                           fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
+    Vec3 lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
+                          fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
+                          fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+    __host__ __device__ GPUTriangle() = default;
+    __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle):
+        triangle(triangle), object_index(object_index), triangle_index(triangle_index), node_index(-1) {
+            highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
+                             fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
+                             fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
+            lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
+                            fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
+                            fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+        }
+};
 
-struct NodeBox{
-
+struct NodeBox {
     Vec3 lowCorner = Vec3(INF, INF, INF);
     Vec3 highCorner = Vec3(-INF, -INF, -INF);
-    __device__ void insert(const Vec3& point){
-        lowCorner.x = fminf(lowCorner.x, point.x);
-        lowCorner.y = fminf(lowCorner.y, point.y);
-        lowCorner.z = fminf(lowCorner.z, point.z);
 
-        highCorner.x = fmaxf(highCorner.x, point.x);
-        highCorner.y = fmaxf(highCorner.y, point.y);
-        highCorner.z = fmaxf(highCorner.z, point.z);
+    __host__ __device__  inline void insert(const Vec3& point) {
+        lowCorner = Vec3(fminf(lowCorner.x, point.x), fminf(lowCorner.y, point.y),
+                         fminf(lowCorner.z, point.z));
+        highCorner = Vec3(fmaxf(highCorner.x, point.x), fmaxf(highCorner.y, point.y),
+                          fmaxf(highCorner.z, point.z));
     }
+    __host__ __device__ inline void insert(const Triangle& triangle) {
+        insert(triangle.p0); insert(triangle.p1); insert(triangle.p2);
+    }
+    __host__ __device__  inline void insert(const NodeBox& other) {
+        insert(other.lowCorner); insert(other.highCorner);
+    }
+    __device__ void pad() {
+        const float scale = 8.0f * 1.1920928955078125e-7f;
+        const Vec3 padding(scale * fmaxf(1.f, fmaxf(fabsf(lowCorner.x), fabsf(highCorner.x))),
+                           scale * fmaxf(1.f, fmaxf(fabsf(lowCorner.y), fabsf(highCorner.y))),
+                           scale * fmaxf(1.f, fmaxf(fabsf(lowCorner.z), fabsf(highCorner.z))));
+        lowCorner -= padding;
+        highCorner += padding;
+    }
+};
 
-    __device__ void insert(const Triangle& triangle){
-        insert(triangle.p0);
-        insert(triangle.p1);
-        insert(triangle.p2);
-    }
-
-    __device__ void insert(const NodeBox& other){
-        insert(other.lowCorner);
-        insert(other.highCorner);
-    }
+void checkCuda(cudaError_t result) {
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(result));
 }
 
-template <typename T> GPUArray{
-    T* data = nullptr;
-    GPUArray(size_t size){
-        cudaMalloc(&data, size * sizeof(T));
-    }
+
+__host__ __device__ inline int countNodes(int n) {
+    if (n == 0) return 0;
+    const int leaves = n / MAX_LEAF_SIZE + (n % MAX_LEAF_SIZE != 0);
+    return leaves + (leaves - 1);
 }
 
-
-int countNodes(int n){
-    int leaves = (n + MAX_LEAF_SIZE - 1) / MAX_LEAF_SIZE;
-    return fmax(0, leaves * 2 - 1);
+__device__ inline unsigned gridLocation(float value, float low, float high) {
+    return high > low
+        ? unsigned(fminf(1023.f, fmaxf(0.f, (value - low) / (high - low) * 1024.f))) : 0;
 }
 
-morton
-
-
-__device__ unsigned gridLocation (float value, float low, float high) {
-    return high > low ? unsigned(fminf(1023.f, fmaxf(0.f, (value - low) / (high - low) * 1024.f))) : 0;
-}
-
-__device__ mortonEncoding(int n; GPUTriangle* triangles, unsigned long long* mortonCodes, NodeBox *fullSpace){
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+__global__ void mortonEncoding(int n, const GPUTriangle* triangles,
+                               unsigned long long* mortonCodes, NodeBox fullSpace) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= n) return;
-    NodeBox temp;
-    temp.insert(triangles[idx].triangle);
-    NodeBox full = *fullSpace;
-    Vec3 center = (temp.lowCorner + temp.highCorner) / 2.0
-    unsigned long long tempMorton = 0;
-    unsigned long long x = gridLocation(center.x, full.lowCorner.x, full.highCorner.x);
-    unsigned long long y = gridLocation(center.y, full.lowCorner.y, full.highCorner.y);
-    unsigned long long z = gridLocation(center.z, full.lowCorner.z, full.highCorner.z);
-    for (int i = 0; i < 10; ++i) {
-        tempMorton |= ((x >> i) & 1) << (3 * i + 2);
-        tempMorton |= ((y >> i) & 1) << (3 * i + 1);
-        tempMorton |= ((z >> i) & 1) << (3 * i);
-    }
-    mortonCodes[idx] = (tempMorton << 44) | idx;
-}
-
-__device__ void calcDelta(int n_triangles, GPUArray<unsigned long long > morotnCodes, GPUArray<unsingned long long> deltas){
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= n_triangles - 1) return;
-    unsigned long long leftCode = morotnCodes[idx];
-    unsigned long long rightCode = morotnCodes[idx + 1];
-    unsigned long long delta = leftCode ^ rightCode;
-    deltas[idx] = delta;
-}
-
-// splitNode: read node_index from the triangles
-__global__ void splitNode(int n_triangles, const GPUTriangle* triangles,
-                          const unsigned long long* deltas,
-                          unsigned long long* best) {
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i >= n_triangles - 1) return;
-    int node = triangles[i].node_index;
-    if (triangles[i + 1].node_index != node) return;
-    unsigned long long key = (deltas[i] & ~IDX_MASK) | (unsigned long long)(i + 1);
-    atomicMax(&best[node], key);
-}
-
-// split_nodes: add the "not active this round" check from last time
-//   if (node.n <= 1 || node.rightNodeIndex != -1) return;
-//   if (best[idx] == 0) return;
-//   int s = (int)(best[idx] & IDX_MASK) - 1;
-
-// reassign: take a raw pointer, not GPUArray
-__global__ void reassign(int n_triangles, GPUTriangle* triangles, const LeafNode* nodes) {
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i >= n_triangles) return;
-    int node = triangles[i].node_index;
-    int right = nodes[node].rightNodeIndex;
-    if (right == -1) return;
-    int s = nodes[right].startIndex - 1;
-    triangles[i].node_index = (i <= s) ? node + 1 : right;
-}
-
-// constructNodes: no nodeOf, takes the triangles pointer
-void constructNodes(int n_triangles, int n_nodes, NodeBox fullSpace,
-                    GPUTriangle* triangles, const unsigned long long* deltas, LeafNode* nodes) {
-    GPUArray<unsigned long long> best(n_nodes);
-    GPUArray<int> d_changed(1);
-
-    initNodes<<<(n_nodes + 255) / 256, 256>>>(n_nodes, n_triangles, nodes, fullSpace);
-
-    int blocksT = (n_triangles + 255) / 256;
-    int blocksN = (n_nodes + 255) / 256;
-    int changed = 1;
-    while (changed) {
-        cudaMemset(best.data, 0, n_nodes * sizeof(unsigned long long));
-        cudaMemset(d_changed.data, 0, sizeof(int));
-        splitNode<<<blocksT, 256>>>(n_triangles, triangles, deltas, best.data);
-        split_nodes<<<blocksN, 256>>>(n_nodes, nodes, best.data, d_changed.data);
-        reassign<<<blocksT, 256>>>(n_triangles, triangles, nodes);
-        cudaMemcpy(&changed, d_changed.data, sizeof(int), cudaMemcpyDeviceToHost);
-    }
-}
-
-__global__ void computeBoxes(int n_nodes, const GPUTriangle* tris, LeafNode* nodes, int* visits) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= n_nodes || nodes[idx].rightNodeIndex != -1) return;   // leaves only
-
     NodeBox box;
-    for (int j = nodes[idx].startIndex; j < nodes[idx].startIndex + nodes[idx].n; ++j)
-        box.insert(tris[j].triangle);
-    nodes[idx].lowCorner = box.lowCorner;
-    nodes[idx].highCorner = box.highCorner;
+    box.insert(triangles[idx].triangle);
+    const Vec3 center = box.lowCorner * 0.5f + box.highCorner * 0.5f;
+    const unsigned x = gridLocation(center.x, fullSpace.lowCorner.x, fullSpace.highCorner.x);
+    const unsigned y = gridLocation(center.y, fullSpace.lowCorner.y, fullSpace.highCorner.y);
+    const unsigned z = gridLocation(center.z, fullSpace.lowCorner.z, fullSpace.highCorner.z);
+    unsigned long long morton = 0;
+    for (int i = 0; i < 10; ++i) {
+        morton |= static_cast<unsigned long long>((x >> i) & 1) << (3 * i + 2);
+        morton |= static_cast<unsigned long long>((y >> i) & 1) << (3 * i + 1);
+        morton |= static_cast<unsigned long long>((z >> i) & 1) << (3 * i);
+    }
+    // Thirty spatial bits plus a unique 32-bit ID fit in a 64-bit key.
+    mortonCodes[idx] = (morton << 32) | static_cast<unsigned long long>(idx);
+}
 
-    int cur = idx;
-    while (nodes[cur].parent_id != -1) {
-        int p = nodes[cur].parent_id;
-        __threadfence();                                  // publish our box
-        if (atomicAdd(&visits[p], 1) == 0) return;        // first child: sibling finishes it
-        __threadfence();
-        NodeBox b;
-        b.insert(nodes[p + 1].lowCorner);  b.insert(nodes[p + 1].highCorner);
-        int r = nodes[p].rightNodeIndex;
-        b.insert(nodes[r].lowCorner);      b.insert(nodes[r].highCorner);
-        nodes[p].lowCorner = b.lowCorner;
-        nodes[p].highCorner = b.highCorner;
-        cur = p;
+__global__ void calcDelta(int n, const unsigned long long* mortonCodes, unsigned long long* deltas) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= n - 1) return;
+    const unsigned long long difference = mortonCodes[idx] ^ mortonCodes[idx + 1];
+    const unsigned long long rank = static_cast<unsigned long long>(64 - __clzll(difference));
+    deltas[idx] = (rank << 32) | (IDX_MASK - static_cast<unsigned long long>(idx));
+}
+
+__global__ void initNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= n_nodes) return;
+    nodes[idx].rightNodeIndex = -1;
+    nodes[idx].n = idx == 0 ? n_triangles : 0;
+    nodes[idx].startIndex = 0;
+    nodes[idx].parent_id = -1;
+}
+
+// One block finds a split between whole leaf groups. The low key bits already
+// break ties, so the winning key must stay intact until its index is decoded.
+__device__ void splitNode(int n_triangles, int n_nodes, const GPUTriangle* triangles,
+                          const unsigned long long* deltas, unsigned long long* best,
+                          int node_index, LeafNode* nodes) {
+    const int start = nodes[node_index].startIndex;
+    const int n = nodes[node_index].n;
+    if (n <= MAX_LEAF_SIZE) return;
+    __shared__ unsigned long long keys[BLOCK_SIZE];
+    unsigned long long key = 0;
+    for (int i = start + MAX_LEAF_SIZE - 1 + threadIdx.x * MAX_LEAF_SIZE;
+         i < start + n - 1; i += blockDim.x * MAX_LEAF_SIZE) {
+        if (deltas[i] > key) key = deltas[i];
+    }
+    keys[threadIdx.x] = key;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset; offset /= 2) {
+        if (threadIdx.x < offset && keys[threadIdx.x + offset] > keys[threadIdx.x])
+            keys[threadIdx.x] = keys[threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *best = keys[0];
+        const int split = static_cast<int>(IDX_MASK - (keys[0] & IDX_MASK));
+        const int left_n = split + 1 - start;
+        const int left = node_index + 1;
+        const int right = left + countNodes(left_n);
+        nodes[node_index].rightNodeIndex = right;
+        nodes[left].n = left_n;
+        nodes[left].startIndex = start;
+        nodes[left].parent_id = node_index;
+        nodes[right].n = n - left_n;
+        nodes[right].startIndex = start + left_n;
+        nodes[right].parent_id = node_index;
+    }
+    __syncthreads();
+}
+
+__global__ void buildBVHSubtree(
+    int n_triangles, int n_nodes, GPUTriangle* triangles,
+    const unsigned long long* deltas, LeafNode* nodes,
+    unsigned long long* best, int first_node, int second_node)
+{
+    // Preorder guarantees parents are initialized before their children.
+    // A single cooperating block avoids device-side recursive launches and
+    // their extra compiler/linker requirements on the server.
+    for (int index = first_node; index < n_nodes; ++index) {
+        splitNode(n_triangles, n_nodes, triangles, deltas, best + index, index, nodes);
+        __syncthreads();
     }
 }
 
-std::vector<Pixel> render_scene(const RenderSettings& settings,const std::vector<Object>& objects) {
-    std::vector<GPUTriangle> triangles;
-    std::vector<Material> materials;
-    int n_triangles = 0;
-    NodeBox fullSpace;
-    for(int object_index = 0; object_index < objects.size(); ++object_index) {
-        const Object& object = objects[object_index];
-        materials.push_back(object.material);
-        n_triangles += object.triangles.size();
-        for (int triangle_index = 0; triangle_index < object.triangles.size(); ++triangle_index) {
-            const Triangle& triangle = object.triangles[triangle_index];
-            GPUTriangle gpu_triangle;
-            gpu_triangle.triangle = triangle;
-            gpu_triangle.object_index = object_index;
-            gpu_triangle.triangle_index = triangle_index;
-            gpu_triangle.id = 0;
-            triangles.push_back(gpu_triangle);
-            fullSpace.insert(triangle);
+__device__ void calcNodeBox(int n_triangles, GPUTriangle* triangles, int start,
+                            int end, Vec3* lowCorner, Vec3* highCorner,
+                            int node_index, bool write_idx) {
+    __shared__ float lows[BLOCK_SIZE][3], highs[BLOCK_SIZE][3];
+    const int t = threadIdx.x;
+    NodeBox box;
+    for (int idx = start + t; idx < end; idx += blockDim.x) {
+        box.insert(triangles[idx].lowCorner);
+        box.insert(triangles[idx].highCorner);
+        if (write_idx) triangles[idx].node_index = node_index;
+    }
+    lows[t][0] = box.lowCorner.x; lows[t][1] = box.lowCorner.y; lows[t][2] = box.lowCorner.z;
+    highs[t][0] = box.highCorner.x; highs[t][1] = box.highCorner.y; highs[t][2] = box.highCorner.z;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset; offset /= 2) {
+        if (t < offset) {
+            for (int axis = 0; axis < 3; ++axis) {
+                lows[t][axis] = fminf(lows[t][axis], lows[t + offset][axis]);
+                highs[t][axis] = fmaxf(highs[t][axis], highs[t + offset][axis]);
+            }
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        box.lowCorner = Vec3(lows[0][0], lows[0][1], lows[0][2]);
+        box.highCorner = Vec3(highs[0][0], highs[0][1], highs[0][2]);
+        box.pad();
+        *lowCorner = box.lowCorner;
+        *highCorner = box.highCorner;
+    }
+}
+
+__global__ void buildBVHBounds(int n_nodes, LeafNode* nodes, GPUTriangle* triangles) {
+    const int index = blockIdx.x;
+    if (index >= n_nodes) return;
+    const int start = nodes[index].startIndex;
+    const int end = start + nodes[index].n;
+    calcNodeBox(end, triangles, start, end, &nodes[index].lowCorner,
+                &nodes[index].highCorner, index, nodes[index].rightNodeIndex == -1);
+}
+
+// Call after initNodes, Morton sorting, and calcDelta.
+void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
+              LeafNode* gpu_nodes, const unsigned long long* deltas) {
+    if (n_nodes == 0) return;
+    unsigned long long* best = nullptr;
+    checkCuda(cudaMalloc(&best, n_nodes * sizeof(unsigned long long)));
+    try {
+        buildBVHSubtree<<<1, BLOCK_SIZE>>>(n_triangles, n_nodes, gpu_triangles,
+                                           deltas, gpu_nodes, best, 0, -1);
+        checkCuda(cudaGetLastError());
+        checkCuda(cudaDeviceSynchronize());
+        buildBVHBounds<<<n_nodes, BLOCK_SIZE>>>(n_nodes, gpu_nodes, gpu_triangles);
+        checkCuda(cudaGetLastError());
+        checkCuda(cudaDeviceSynchronize());
+    } catch (...) {
+        cudaFree(best);
+        throw;
+    }
+    checkCuda(cudaFree(best));
+}
+
+__global__ void convertToGPUTriagles(int n_triangles, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= n_triangles) return;
+    gpu_triangles[idx] = GPUTriangle(object_indices[idx], idx, triangles[idx]);
+}
+// Slab intersection, including rays parallel to a face of the box.
+__device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest) {
+    // Triangle intersection and slab division can round the same distance
+    // differently, especially for coplanar triangles. Only pruning gets slack.
+    float near = 0.0f;
+    float far = closest + EPSILON * fmaxf(1.0f, fabsf(closest));
+    for (int axis = 0; axis < 3; ++axis) {
+        const float origin = axis == 0 ? ray.origin.x : axis == 1 ? ray.origin.y : ray.origin.z;
+        const float direction = axis == 0 ? ray.direction.x : axis == 1 ? ray.direction.y : ray.direction.z;
+        const float low = axis == 0 ? node.lowCorner.x : axis == 1 ? node.lowCorner.y : node.lowCorner.z;
+        const float high = axis == 0 ? node.highCorner.x : axis == 1 ? node.highCorner.y : node.highCorner.z;
+        if (direction == 0.0f) {
+            if (origin < low || origin > high) return false;
+        } else {
+            const float a = (low - origin) / direction;
+            const float b = (high - origin) / direction;
+            near = fmaxf(near, fminf(a, b));
+            far = fminf(far, fmaxf(a, b));
+            if (near > far) return false;
         }
     }
-    GPUArray<GPUTriangle> gpu_triangles(n_triangles);
-    cudaMemcpy(gpu_triangles.data, triangles.data(), n_triangles * sizeof(GPUTriangle), cudaMemcpyHostToDevice);
-    GPUArray<Material> gpu_materials(materials.size());
-    cudaMemcpy(gpu_materials.data, materials.data(), materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
-    GPUArray<Pixel> gpu_pixels(settings.width * settings.height);
+    return true;
+}
+
+__device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
+                          const LeafNode* nodes, int n_nodes, int previous_triangle) {
+    Hit hit;
+    // Preorder ranges allow a missed subtree to be skipped without a stack.
+    for (int index = 0; index < n_nodes;) {
+        const LeafNode& node = nodes[index];
+        if (!intersectNode(ray, node, hit.record.t)) {
+            index += countNodes(node.n);
+            continue;
+        }
+        if (node.rightNodeIndex == -1) {
+            for (int i = node.startIndex; i < node.startIndex + node.n; ++i) {
+                const GPUTriangle& triangle = triangles[i];
+                if (triangle.triangle_index == previous_triangle) continue;
+                HitRecord record;
+                if (intersect_triangle(ray, triangle.triangle, &record) &&
+                    (record.t < hit.record.t ||
+                     (record.t == hit.record.t && triangle.triangle_index < hit.triangle_index))) {
+                    hit.record = record;
+                    hit.object_index = triangle.object_index;
+                    hit.triangle_index = triangle.triangle_index;
+                }
+            }
+        }
+        ++index;
+    }
+    return hit;
+}
+
+__device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
+                          const GPUTriangle* triangles, const LeafNode* nodes,
+                          int n_nodes, const ObjectMaterial* materials, RandomGPU& random) {
+    Vec3 light, throughput(1.0f, 1.0f, 1.0f);
+    int previous_triangle = -1;
+    for (int bounce = 0; ; ++bounce) {
+        const Hit hit = closestHit(ray, triangles, nodes, n_nodes, previous_triangle);
+        if (!hit.hit()) {
+            light += multiply(throughput, settings.background_light);
+            break;
+        }
+        const ObjectMaterial& material = materials[hit.object_index];
+        light += multiply(throughput, material.emission);
+        if (bounce >= settings.max_bounces) break;
+        throughput = multiply(throughput, material.albedo);
+        ray = cosine_weighted_sampling(hit.record, random);
+        previous_triangle = hit.triangle_index;
+    }
+    return light;
+}
+
+__global__ void renderPixels(RenderSettings settings, const GPUTriangle* triangles,
+                             const LeafNode* nodes, int n_nodes,
+                             const ObjectMaterial* materials, Pixel* pixels, size_t n_pixels) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n_pixels) return;
+    const int x = int(index % settings.width), y = int(index / settings.width);
+    const int ss = settings.supersampling_factor;
+    // Each output pixel owns its random stream and all of its subpixel samples.
+    uint32_t seed = uint32_t(index) ^ settings.seed;
+    seed ^= seed >> 16; seed *= 0x7feb352du;
+    seed ^= seed >> 15; seed *= 0x846ca68bu; seed ^= seed >> 16;
+    RandomGPU random(seed);
+    Vec3 color;
+    for (int dy = 0; dy < ss; ++dy) {
+        for (int dx = 0; dx < ss; ++dx) {
+            const Ray ray = make_camera_ray(settings, x * ss + dx, y * ss + dy);
+            for (int sample = 0; sample < settings.samples_per_pixel; ++sample)
+                color += tracePath(ray, settings, triangles, nodes, n_nodes, materials, random);
+        }
+    }
+    pixels[index] = to_pixel(color / (float(settings.samples_per_pixel) * ss * ss));
+}
+
+std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vector<Object>& objects) {
+    if (settings.width <= 0 || settings.height <= 0 ||
+        settings.samples_per_pixel <= 0 || settings.supersampling_factor <= 0 ||
+        settings.max_bounces < 0)
+        throw std::invalid_argument("Invalid render settings");
+    const size_t n_pixels = size_t(settings.width) * settings.height;
+    // 1. Collect triangles and materials on CPU
+    std::vector<Triangle> triangles;
+    std::vector<int> triangle_object_indices;
+    std::vector<ObjectMaterial> materials(objects.size());
+    NodeBox fullSpace;
+
+    for (int object_index = 0; object_index < objects.size(); ++object_index) {
+        const Object& object = objects[object_index];
+
+        materials[object_index] = ObjectMaterial{
+            object.emission,
+            object.albedo
+        };
+
+        for (const Triangle& triangle : object.triangles) {
+            fullSpace.insert(triangle);
+            triangles.push_back(triangle);
+            triangle_object_indices.push_back(object_index);
+        }
+    }
+
+    if (triangles.empty())
+        return std::vector<Pixel>(n_pixels, to_pixel(settings.background_light));
+    if (triangles.size() > size_t(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Too many triangles");
+    int n_triangles = static_cast<int>(triangles.size());
     int n_nodes = countNodes(n_triangles);
-    GPUArray<LeafNode> gpu_nodes(n_nodes);
-    GPUArray<unsigned long long> deltas(n_triangles - 1);
-    gpu_nodes[0] = fullSpace;
-    GPUArray<unsigned long long> gpu_mortonCodes(n_triangles);
-    mortonEncoding<<<(n_triangles + 255) / 256, 256>>>(n_triangles, gpu_triangles.data, gpu_mortonCodes.data, &fullSpace);
-    thrust::sort_by_key(thrust::device, gpu_mortonCodes.data, gpu_mortonCodes.data + n_triangles, gpu_triangles.data);
-    clacDelta<<<(n_triangles + 255) / 256, 256>>>(n_triangles, gpu_mortonCodes.data, deltas.data);
-    constructBVD<<<(n_triangles + 255) / 256, 256>>>(n_triangles, n_nodes, gpu_triangles.data, gpu_mortonCodes.data, &fullSpace, gpu_nodes.data);
-    
+
+
+    // 2. Declare GPU pointers
+    Triangle* gpu_raw_triangles = nullptr;
+    GPUTriangle* gpu_triangles = nullptr;
+    LeafNode* gpu_nodes = nullptr;
+    ObjectMaterial* gpu_materials = nullptr;
+    int* gpu_triangle_object_indices = nullptr;
+    unsigned long long* mortonCodes = nullptr;
+    unsigned long long* deltas = nullptr;
+    Pixel* gpu_pixels = nullptr;
+    auto release = [&]() {
+        cudaFree(gpu_raw_triangles);
+        cudaFree(gpu_triangle_object_indices);
+        cudaFree(gpu_triangles);
+        cudaFree(gpu_materials);
+        cudaFree(gpu_nodes);
+        cudaFree(mortonCodes);
+        cudaFree(deltas);
+        cudaFree(gpu_pixels);
+    };
+    try {
+
+
+        // 3. Allocate GPU memory
+        checkCuda(cudaMalloc(&gpu_raw_triangles, n_triangles * sizeof(Triangle)));
+        checkCuda(cudaMalloc(&gpu_triangle_object_indices, n_triangles * sizeof(int)));
+        checkCuda(cudaMalloc(&gpu_triangles, n_triangles * sizeof(GPUTriangle)));
+        checkCuda(cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial)));
+        checkCuda(cudaMalloc(&gpu_nodes, n_nodes * sizeof(LeafNode)));
+        checkCuda(cudaMalloc(&mortonCodes, n_triangles * sizeof(unsigned long long)));
+        checkCuda(cudaMalloc(&deltas, n_triangles * sizeof(unsigned long long)));
+
+
+        // 4. Copy CPU data to GPU
+        checkCuda(cudaMemcpy(
+            gpu_raw_triangles,
+            triangles.data(),
+            n_triangles * sizeof(Triangle),
+            cudaMemcpyHostToDevice
+        ));
+
+        checkCuda(cudaMemcpy(
+            gpu_triangle_object_indices,
+            triangle_object_indices.data(),
+            n_triangles * sizeof(int),
+            cudaMemcpyHostToDevice
+        ));
+
+        checkCuda(cudaMemcpy(
+            gpu_materials,
+            materials.data(),
+            objects.size() * sizeof(ObjectMaterial),
+            cudaMemcpyHostToDevice
+        ));
+
+
+        // 5. Convert triangles into GPU triangle structures
+        convertToGPUTriagles<<<
+            (n_triangles + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            BLOCK_SIZE
+        >>>(
+            n_triangles,
+            gpu_raw_triangles,
+            gpu_triangles,
+            gpu_triangle_object_indices
+        );
+
+
+        // 6. Free temporary GPU arrays
+        checkCuda(cudaGetLastError());
+        checkCuda(cudaDeviceSynchronize());
+        checkCuda(cudaFree(gpu_raw_triangles));
+        gpu_raw_triangles = nullptr;
+        checkCuda(cudaFree(gpu_triangle_object_indices));
+        gpu_triangle_object_indices = nullptr;
+
+
+        // 7. Initialize BVH nodes
+        initNodes<<<
+            (n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            BLOCK_SIZE
+        >>>(
+            n_nodes,
+            n_triangles,
+            gpu_nodes
+        );
+
+
+        // 8. Generate Morton codes
+        checkCuda(cudaGetLastError());
+        mortonEncoding<<<(n_triangles + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            n_triangles, gpu_triangles, mortonCodes, fullSpace);
+        checkCuda(cudaGetLastError());
+
+
+        // 9. Sort triangles by Morton codes
+        thrust::sort_by_key(
+            thrust::device,
+            mortonCodes,
+            mortonCodes + n_triangles,
+            gpu_triangles
+        );
+
+
+        // 10. Calculate Morton code deltas
+        calcDelta<<<
+            (n_triangles + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            BLOCK_SIZE
+        >>>(
+            n_triangles,
+            mortonCodes,
+            deltas
+        );
+
+
+        // 11. Build BVH
+        checkCuda(cudaGetLastError());
+        buildBVH(
+            n_nodes,
+            n_triangles,
+            gpu_triangles,
+            gpu_nodes,
+            deltas
+        );
+
+        // 12. Trace samples, average subpixels, and return the final image.
+        checkCuda(cudaMalloc(&gpu_pixels, n_pixels * sizeof(Pixel)));
+        renderPixels<<<unsigned((n_pixels + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+            settings, gpu_triangles, gpu_nodes, n_nodes, gpu_materials, gpu_pixels, n_pixels);
+        checkCuda(cudaGetLastError());
+        std::vector<Pixel> pixels(n_pixels);
+        checkCuda(cudaMemcpy(pixels.data(), gpu_pixels, n_pixels * sizeof(Pixel), cudaMemcpyDeviceToHost));
+        release();
+        return pixels;
+    } catch (...) {
+        release();
+        throw;
+    }
 }
