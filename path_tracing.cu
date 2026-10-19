@@ -261,21 +261,19 @@ __device__ bool intersect_triangle_gpu(GPUTriangle triangle, Ray ray, HitRecord*
     if (t <= EPSILON) {
         return false;
     }
-
+    record->unit_normal = - triangle.normal;
     if (dot(triangle.normal, ray.direction) > 0.0) {
-        triangle.normal = -triangle.normal;
+        record->unit_normal *= -1;
     }
     record->t = t;
     record->position = ray.origin + t * ray.direction;
-    record->unit_normal = triangle.normal;
-
     return true;
 }
 __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
                                 int previous_triangle, Hit& closest) {
     if (triangle.triangle_index == previous_triangle) return;
     HitRecord record;
-    if (!intersect_triangle_gpu(ray, triangle, &record)) return;
+    if (!intersect_triangle_gpu(triangle, ray, &record)) return;
     if (record.t < closest.record.t ||
         (record.t == closest.record.t && triangle.triangle_index < closest.triangle_index)) {
         closest.record = record;
