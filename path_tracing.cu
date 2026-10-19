@@ -101,7 +101,7 @@ __device__ inline unsigned gridLocation(float value, float low, float high) {
         ? unsigned(fminf(1023.f, fmaxf(0.f, (value - low) / (high - low) * 1024.f))) : 0;
 }
 
- unsigned long mortonEncoding(int idx, const GPUTriangle triangle,
+__device__ unsigned long mortonEncoding(int idx, const GPUTriangle triangle,
                                unsigned long* mortonCodes, NodeBox fullSpace) {
     const Vec3 center = triangle.lowCorner * 0.5f + triangle.highCorner * 0.5f;
     const unsigned x = gridLocation(center.x, fullSpace.lowCorner.x, fullSpace.highCorner.x);
@@ -248,11 +248,11 @@ void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
     checkCuda(cudaFree(best));
 }
 
-__global__ void convertToGPUTriagles(int n_triangles, unsigned long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices) {
+__global__ void convertToGPUTriagles(int n_triangles, unsigned long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= n_triangles) return;
     gpu_triangles[idx] = GPUTriangle(object_indices[idx], idx, triangles[idx]);
-    morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, NodeBox());
+    morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, fullSpace);
 }
 // Slab intersection, including rays parallel to a face of the box.
 __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest) {
@@ -443,10 +443,11 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
             BLOCK_SIZE
         >>>(
             n_triangles,
-            gpu_raw_triangles,
             mortonCodes,
+            gpu_raw_triangles,
             gpu_triangles,
-            gpu_triangle_object_indices
+            gpu_triangle_object_indices,
+            fullSpace
         );
 
 
