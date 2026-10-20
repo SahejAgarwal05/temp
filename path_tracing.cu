@@ -126,6 +126,7 @@ __global__ void calcDelta(int n, const unsigned long long* mortonCodes, unsigned
 
 // Find the largest delta between complete leaf groups, then create both children.
 __device__ void splitNode(const unsigned long long* deltas, int node_index, LeafNode* nodes) {
+    if (nodes[node_index].n <= MAX_LEAF_SIZE) return;
     const int start = nodes[node_index].startIndex;
     const int n = nodes[node_index].n;
     const unsigned long long *i = thrust::max_element(thrust::device, deltas + start, deltas + start + n - 1);
@@ -323,22 +324,23 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
                           const Hit* first_hit = nullptr) {
     Vec3 light, throughput(1.0f, 1.0f, 1.0f), zero(0,0,0);
     int previous_triangle = -1;
+    thrust::device_vector<Vec3> path_vertices;
     for (int bounce = 0; ; ++bounce) {
         // All samples of a subpixel share the deterministic camera intersection.
         const Hit hit = bounce == 0 && first_hit != nullptr
             ? *first_hit : closestHit(ray, triangles, nodes, n_nodes, previous_triangle);
         if (!hit.hit() || length(throughput - zero) < EPSILON) {
-            light += multiply(throughput, settings.background_light);
+            path_vertices.push_back(multiply(throughput, settings.background_light));
             break;
         }
         const ObjectMaterial& material = materials[hit.object_index];
-        light += multiply(throughput, material.emission);
+        path_vertices.push_back(multiply(throughput, material.emission));
         if (bounce >= settings.max_bounces) break;
         throughput = multiply(throughput, material.albedo);
         ray = cosine_weighted_sampling(hit.record, random);
         previous_triangle = hit.triangle_index;
     }
-    return light;
+    return thrust::reduce(thrust::device, path_vertices.begin(), path_vertices.end(), Vec3(0, 0, 0), thrust::plus<Vec3>());
 }
 
 __global__ void findSubpixelFirstHits(RenderSettings settings, const GPUTriangle* triangles,
