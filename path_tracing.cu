@@ -6,6 +6,11 @@
 #include "graphics.cuh"
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
+#include <thrust/reduce.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
 
 
 constexpr int MAX_LEAF_SIZE = 2;
@@ -324,23 +329,22 @@ __device__ Vec3 tracePath(Ray ray, const RenderSettings& settings,
                           const Hit* first_hit = nullptr) {
     Vec3 light, throughput(1.0f, 1.0f, 1.0f), zero(0,0,0);
     int previous_triangle = -1;
-    thrust::device_vector<Vec3> path_vertices;
     for (int bounce = 0; ; ++bounce) {
         // All samples of a subpixel share the deterministic camera intersection.
         const Hit hit = bounce == 0 && first_hit != nullptr
             ? *first_hit : closestHit(ray, triangles, nodes, n_nodes, previous_triangle);
         if (!hit.hit() || length(throughput - zero) < EPSILON) {
-            path_vertices.push_back(multiply(throughput, settings.background_light));
+            light += multiply(throughput, settings.background_light);
             break;
         }
         const ObjectMaterial& material = materials[hit.object_index];
-        path_vertices.push_back(multiply(throughput, material.emission));
+        light += multiply(throughput, material.emission);
         if (bounce >= settings.max_bounces) break;
         throughput = multiply(throughput, material.albedo);
         ray = cosine_weighted_sampling(hit.record, random);
         previous_triangle = hit.triangle_index;
     }
-    return thrust::reduce(thrust::device, path_vertices.begin(), path_vertices.end(), Vec3(0, 0, 0), thrust::plus<Vec3>());
+    return light;
 }
 
 __global__ void findSubpixelFirstHits(RenderSettings settings, const GPUTriangle* triangles,
@@ -353,39 +357,31 @@ __global__ void findSubpixelFirstHits(RenderSettings settings, const GPUTriangle
     subpixel_first_hits[subpixel_index] = closestHit(camera_ray, triangles, nodes, bvh_node_count, -1);
 }
 
-// CUDA atomics operate on scalar components, so add an RGB color componentwise.
-__device__ void atomicAddColor(Vec3* sum, const Vec3& color) {
-    atomicAdd(&sum->x, color.x);
-    atomicAdd(&sum->y, color.y);
-    atomicAdd(&sum->z, color.z);
-}
+struct ColorGroupIndex {
+    size_t colors_per_group;
+    __host__ __device__ size_t operator()(size_t color_index) const {
+        return color_index / colors_per_group;
+    }
+};
 
-__global__ void traceSubpixelSamples(RenderSettings settings, const GPUTriangle* triangles,
-                                     const LeafNode* nodes, int bvh_node_count,
-                                     const ObjectMaterial* materials, Vec3* subpixel_radiance_sums,
-                                     const Hit* subpixel_first_hits, size_t subpixel_count) {
-    // Each thread traces one path sample from its subpixel's cached first hit.
-    const size_t path_sample_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t subpixel_index = path_sample_index / settings.samples_per_pixel;
-    if (subpixel_index >= subpixel_count) return;
-
-    RandomGPU random(path_sample_index);
-    const Vec3 sample_color = tracePath(Ray{}, settings, triangles, nodes, bvh_node_count,materials, random, &subpixel_first_hits[subpixel_index]);
-
-    atomicAddColor(subpixel_radiance_sums + subpixel_index, sample_color);
-}
-
-__global__ void averageSubpixelSamples(RenderSettings settings, const Vec3* subpixel_radiance_sums,
-                                       Vec3* pixel_radiance_sums, size_t subpixel_count) {
-    const size_t subpixel_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (subpixel_index >= subpixel_count) return;
-    const size_t subpixels_per_axis = settings.supersampling_factor;
-    const size_t subpixel_grid_width = size_t(settings.width) * subpixels_per_axis;
-    const size_t pixel_x = (subpixel_index % subpixel_grid_width) / subpixels_per_axis;
-    const size_t pixel_y = (subpixel_index / subpixel_grid_width) / subpixels_per_axis;
-    const size_t pixel_index = pixel_y * settings.width + pixel_x;
-    const Vec3 subpixel_color = subpixel_radiance_sums[subpixel_index] / float(settings.samples_per_pixel);
-    atomicAddColor(pixel_radiance_sums + pixel_index, subpixel_color);
+// One thread traces one branch, with samples stored together by output pixel.
+__global__ void tracePixelSamples(RenderSettings settings, const GPUTriangle* triangles,
+                                  const LeafNode* nodes, int node_count,
+                                  const ObjectMaterial* materials, const Hit* first_hits,
+                                  Vec3* sample_colors, size_t sample_count) {
+    const size_t sample_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample_index >= sample_count) return;
+    const size_t ss = settings.supersampling_factor;
+    const size_t grouped_subpixel = sample_index / settings.samples_per_pixel;
+    const size_t pixel_index = grouped_subpixel / (ss * ss);
+    const size_t local_subpixel = grouped_subpixel % (ss * ss);
+    const size_t subpixel_x = (pixel_index % settings.width) * ss + local_subpixel % ss;
+    const size_t subpixel_y = (pixel_index / settings.width) * ss + local_subpixel / ss;
+    const size_t subpixel_index = subpixel_y * size_t(settings.width) * ss + subpixel_x;
+    const size_t branch_index = sample_index % settings.samples_per_pixel;
+    RandomGPU random(subpixel_index * settings.samples_per_pixel + branch_index);
+    sample_colors[sample_index] = tracePath(Ray{}, settings, triangles, nodes, node_count,
+                                           materials, random, &first_hits[subpixel_index]);
 }
 
 __global__ void finalizeOutputPixels(RenderSettings settings, const Vec3* pixel_radiance_sums,
@@ -395,16 +391,18 @@ __global__ void finalizeOutputPixels(RenderSettings settings, const Vec3* pixel_
     const int subpixels_per_axis = settings.supersampling_factor;
     // Average linear colors before tone mapping and gamma correction.
     output_pixels[output_pixel_index] = to_pixel(pixel_radiance_sums[output_pixel_index] /
-        (float(subpixels_per_axis) * subpixels_per_axis));
+        (float(subpixels_per_axis) * subpixels_per_axis * settings.samples_per_pixel));
 }
 
 std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vector<Object>& objects) {
     // Each subpixel has one camera ray and one cached first hit.
     // samples_per_pixel is the existing setting for path samples per subpixel.
     const int subpixels_per_axis = settings.supersampling_factor;
-    const int samples_per_subpixel = settings.samples_per_pixel;
     const size_t output_pixel_count = size_t(settings.width) * settings.height;
     const size_t subpixel_count = output_pixel_count * subpixels_per_axis * subpixels_per_axis;
+    const size_t samples_per_output_pixel = size_t(subpixels_per_axis) * subpixels_per_axis
+                                           * settings.samples_per_pixel;
+    const size_t sample_count = output_pixel_count * samples_per_output_pixel;
     // 1. Collect triangles and materials on CPU
     std::vector<Triangle> triangles;
     std::vector<int> triangle_object_indices;
@@ -440,7 +438,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     unsigned long long* deltas = nullptr;
     Pixel* gpu_output_pixels = nullptr;
     Vec3* gpu_pixel_radiance_sums = nullptr;
-    Vec3* gpu_subpixel_radiance_sums = nullptr;
+    Vec3* gpu_sample_colors = nullptr;
     Hit* gpu_subpixel_first_hits = nullptr;
     auto release = [&]() {
         cudaFree(gpu_raw_triangles);
@@ -452,7 +450,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaFree(deltas);
         cudaFree(gpu_output_pixels);
         cudaFree(gpu_pixel_radiance_sums);
-        cudaFree(gpu_subpixel_radiance_sums);
+        cudaFree(gpu_sample_colors);
         cudaFree(gpu_subpixel_first_hits);
     };
     cudaMalloc(&gpu_raw_triangles, triangle_count * sizeof(Triangle));
@@ -538,22 +536,25 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
             deltas
         );
 
-        // 12. Trace samples, average subpixels, and return the final image.
+        // 12. Trace every branch, sum by output pixel, and average once.
         cudaMalloc(&gpu_output_pixels, output_pixel_count * sizeof(Pixel));
         cudaMalloc(&gpu_pixel_radiance_sums, output_pixel_count * sizeof(Vec3));
-        cudaMemset(gpu_pixel_radiance_sums, 0, output_pixel_count * sizeof(Vec3));
-        cudaMalloc(&gpu_subpixel_radiance_sums, subpixel_count * sizeof(Vec3));
-        cudaMemset(gpu_subpixel_radiance_sums, 0, subpixel_count * sizeof(Vec3));
+        cudaMalloc(&gpu_sample_colors, sample_count * sizeof(Vec3));
         cudaMalloc(&gpu_subpixel_first_hits, subpixel_count * sizeof(Hit));
         const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
         findSubpixelFirstHits<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
             settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits, subpixel_count, subpixel_grid_width);
-        const size_t path_sample_count = subpixel_count * samples_per_subpixel;
-        traceSubpixelSamples<<<unsigned((path_sample_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_materials, gpu_subpixel_radiance_sums,
-            gpu_subpixel_first_hits, subpixel_count);
-        averageSubpixelSamples<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_subpixel_radiance_sums, gpu_pixel_radiance_sums, subpixel_count);
+        tracePixelSamples<<<unsigned((sample_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_materials,
+            gpu_subpixel_first_hits, gpu_sample_colors, sample_count);
+        const auto sample_indices = thrust::make_counting_iterator<size_t>(0);
+        const auto pixel_keys = thrust::make_transform_iterator(
+            sample_indices, ColorGroupIndex{samples_per_output_pixel});
+        thrust::reduce_by_key(thrust::device, pixel_keys, pixel_keys + sample_count,
+                              gpu_sample_colors, thrust::make_discard_iterator(), gpu_pixel_radiance_sums,
+                              thrust::equal_to<size_t>(), thrust::plus<Vec3>());
+        cudaFree(gpu_sample_colors);
+        gpu_sample_colors = nullptr;
         finalizeOutputPixels<<<unsigned((output_pixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
             settings, gpu_pixel_radiance_sums, gpu_output_pixels, output_pixel_count);
         std::vector<Pixel> output_pixels(output_pixel_count);
