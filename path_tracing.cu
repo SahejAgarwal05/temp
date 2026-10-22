@@ -168,44 +168,8 @@ struct MinVec3 {
     }
 };
 
-Vec3 computeLowCorner(const GPUTriangle* triangle1, const GPUTriangle* triangle2)
-{
-    // Identity element for min: +infinity (FLT_MAX)
-    Vec3 init(FLT_MAX, FLT_MAX, FLT_MAX);
-    return thrust::transform_reduce(
-        triangle1, triangle2,
-        GetLowCorner(),   // transform
-        init,             // initial value
-        MinVec3());       // reduction
-}
-struct GetHighCorner {
-    __host__ __device__
-    Vec3 operator()(const GPUTriangle& t) const {
-        return t.highCorner;
-    }
-};
 
-// Component-wise max of two Vec3
-struct MaxVec3 {
-    __host__ __device__
-    Vec3 operator()(const Vec3& a, const Vec3& b) const {
-        return Vec3(fmaxf(a.x, b.x),
-                    fmaxf(a.y, b.y),
-                    fmaxf(a.z, b.z));
-    }
-};
-
-Vec3 computeHighCorner(const GPUTriangle* triangle1, const GPUTriangle* triangle2)
-{
-    return thrust::transform_reduce(
-        triangle1, triangle2,
-        GetHighCorner(),   // transform
-        Vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX),             // initial value
-        MaxVec3());       // reduction
-}
-
-
-NodeBox computeNodeBox(const GPUTriangle* triangles, int startIndex, int endIndex) {
+__device__ NodeBox computeNodeBox(const GPUTriangle* triangles, int startIndex, int endIndex) {
     Vec3 lowCorner = computeLowCorner(triangles + startIndex, triangles + endIndex + 1);
     Vec3 highCorner = computeHighCorner(triangles + startIndex, triangles + endIndex + 1);
     NodeBox box(lowCorner, highCorner);
