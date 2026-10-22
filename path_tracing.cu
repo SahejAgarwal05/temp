@@ -110,17 +110,18 @@ struct NodeBox {
         lowCorner = box1.lowCorner;
         highCorner = box1.highCorner;
     }
+    __host__device__ inline NodeBox operator+(const NodeBox& a, const NodeBox& b) {
+        NodeBox result;
+        result.lowCorner = Vec3(fminf(a.lowCorner.x, b.lowCorner.x),
+                                fminf(a.lowCorner.y, b.lowCorner.y),
+                                fminf(a.lowCorner.z, b.lowCorner.z));
+        result.highCorner = Vec3(fmaxf(a.highCorner.x, b.highCorner.x),
+                                fmaxf(a.highCorner.y, b.highCorner.y),
+                                fmaxf(a.highCorner.z, b.highCorner.z));
+        return result;
+    }
 };
-__host__device__ inline NodeBox operator+(const NodeBox& a, const NodeBox& b) {
-    NodeBox result;
-    result.lowCorner = Vec3(fminf(a.lowCorner.x, b.lowCorner.x),
-                            fminf(a.lowCorner.y, b.lowCorner.y),
-                            fminf(a.lowCorner.z, b.lowCorner.z));
-    result.highCorner = Vec3(fmaxf(a.highCorner.x, b.highCorner.x),
-                             fmaxf(a.highCorner.y, b.highCorner.y),
-                             fmaxf(a.highCorner.z, b.highCorner.z));
-    return result;
-}
+
 __host__ __device__ inline int countNodes(int n) {
     if (n == 0) return 0;
     const int leaves = n / MAX_LEAF_SIZE + (n % MAX_LEAF_SIZE != 0);
@@ -169,13 +170,6 @@ struct MinVec3 {
 };
 
 
-__device__ NodeBox computeNodeBox(const GPUTriangle* triangles, int startIndex, int endIndex) {
-    Vec3 lowCorner = computeLowCorner(triangles + startIndex, triangles + endIndex + 1);
-    Vec3 highCorner = computeHighCorner(triangles + startIndex, triangles + endIndex + 1);
-    NodeBox box(lowCorner, highCorner);
-    box.pad();
-    return box;
-}
 void computerCorner(int* startIndex, int endIndex, GPUTriangle* triangles, Vec3* lowCorner, Vec3* highCorner) {
     NodeBox box = thrust::reduce(triangles + startIndex, triangles + endIndex + 1, NodeBox(), NodeBox::operator+);
     *lowCorner = box.lowCorner;
