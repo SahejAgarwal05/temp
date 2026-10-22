@@ -1,22 +1,16 @@
-#include <cstdint>
-#include <limits>
-#include <stdexcept>
-#include <string>
-
 #include "graphics.cuh"
+
 #include <thrust/execution_policy.h>
-#include <thrust/sort.h>
-#include <thrust/reduce.h>
 #include <thrust/functional.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
-
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/reduce.h>
+#include <thrust/sort.h>
 
 constexpr int MAX_LEAF_SIZE = 2;
 constexpr int BLOCK_SIZE = 256;
 
-using namespace std;
 struct Hit {
     HitRecord record;
     int object_index = -1;
@@ -51,49 +45,48 @@ struct GPUTriangle {
     Vec3 highCorner;
     Vec3 lowCorner;
     Vec3 p0;
+
     __host__ __device__ GPUTriangle() = default;
-    __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle2):
-        object_index(object_index), triangle_index(triangle_index) {
-            highCorner = Vec3(fmaxf(triangle2.p0.x, fmaxf(triangle2.p1.x, triangle2.p2.x)),
-                             fmaxf(triangle2.p0.y, fmaxf(triangle2.p1.y, triangle2.p2.y)),
-                             fmaxf(triangle2.p0.z, fmaxf(triangle2.p1.z, triangle2.p2.z)));
-            lowCorner = Vec3(fminf(triangle2.p0.x, fminf(triangle2.p1.x, triangle2.p2.x)),
-                            fminf(triangle2.p0.y, fminf(triangle2.p1.y, triangle2.p2.y)),
-                            fminf(triangle2.p0.z, fminf(triangle2.p1.z, triangle2.p2.z)));
-            edge0 = triangle2.p1 - triangle2.p0;
-            edge1 = triangle2.p2 - triangle2.p0;
-            p0 = triangle2.p0;
-            normal = normalize(cross(edge0, edge1));
-        }
+
+    __host__ __device__ GPUTriangle(int object_index, int triangle_index, const Triangle& triangle)
+        : object_index(object_index), triangle_index(triangle_index) {
+        highCorner = Vec3(fmaxf(triangle.p0.x, fmaxf(triangle.p1.x, triangle.p2.x)),
+                          fmaxf(triangle.p0.y, fmaxf(triangle.p1.y, triangle.p2.y)),
+                          fmaxf(triangle.p0.z, fmaxf(triangle.p1.z, triangle.p2.z)));
+        lowCorner = Vec3(fminf(triangle.p0.x, fminf(triangle.p1.x, triangle.p2.x)),
+                         fminf(triangle.p0.y, fminf(triangle.p1.y, triangle.p2.y)),
+                         fminf(triangle.p0.z, fminf(triangle.p1.z, triangle.p2.z)));
+        edge0 = triangle.p1 - triangle.p0;
+        edge1 = triangle.p2 - triangle.p0;
+        p0 = triangle.p0;
+        normal = normalize(cross(edge0, edge1));
+    }
 };
 
 struct NodeBox {
     Vec3 lowCorner = Vec3(INF, INF, INF);
     Vec3 highCorner = Vec3(-INF, -INF, -INF);
 
-    __host__ __device__  inline void insert(const Vec3& point) {
+    __host__ __device__ NodeBox() = default;
+
+    __host__ __device__ void insert(const Vec3& point) {
         lowCorner = Vec3(fminf(lowCorner.x, point.x), fminf(lowCorner.y, point.y),
                          fminf(lowCorner.z, point.z));
         highCorner = Vec3(fmaxf(highCorner.x, point.x), fmaxf(highCorner.y, point.y),
                           fmaxf(highCorner.z, point.z));
     }
-    __host__ __device__ inline void insert(const Triangle& triangle) {
-        insert(triangle.p0); insert(triangle.p1); insert(triangle.p2);
+
+    __host__ __device__ void insert(const Triangle& triangle) {
+        insert(triangle.p0);
+        insert(triangle.p1);
+        insert(triangle.p2);
     }
-    __host__ __device__  inline void insert(const NodeBox& other) {
-        updateLowHigh(other);
+
+    __host__ __device__ void insert(const GPUTriangle& triangle) {
+        insert(triangle.lowCorner);
+        insert(triangle.highCorner);
     }
-    __host__ __device__  inline void insert(const GPUTriangle& triangle) {
-        updateLowHigh(NodeBox(triangle));
-    }
-    __host__ __device__ void updateLowHigh(const NodeBox& other) {
-        lowCorner = Vec3(fminf(lowCorner.x, other.lowCorner.x),
-                         fminf(lowCorner.y, other.lowCorner.y),
-                         fminf(lowCorner.z, other.lowCorner.z));
-        highCorner = Vec3(fmaxf(highCorner.x, other.highCorner.x),
-                          fmaxf(highCorner.y, other.highCorner.y),
-                          fmaxf(highCorner.z, other.highCorner.z));
-    }
+
     __device__ void pad() {
         const float scale = 8.0f * 1.1920928955078125e-7f;
         const Vec3 padding(scale * fmaxf(1.f, fmaxf(fabsf(lowCorner.x), fabsf(highCorner.x))),
@@ -101,24 +94,6 @@ struct NodeBox {
                            scale * fmaxf(1.f, fmaxf(fabsf(lowCorner.z), fabsf(highCorner.z))));
         lowCorner -= padding;
         highCorner += padding;
-    }
-    __device__ NodeBox (Vec3 low, Vec3 high): lowCorner(low), highCorner(high) {}
-    __host__ __device__ NodeBox (GPUTriangle triangle): lowCorner(triangle.lowCorner), highCorner(triangle.highCorner) {}
-    __host__ __device__ NodeBox() (GPUTriangle triangle1, GPUTriangle triangle2){
-        NodeBox box1(triangle1);
-        box1.insert(triangle2);
-        lowCorner = box1.lowCorner;
-        highCorner = box1.highCorner;
-    }
-    __host__device__ inline NodeBox operator+(const NodeBox& a, const NodeBox& b) {
-        NodeBox result;
-        result.lowCorner = Vec3(fminf(a.lowCorner.x, b.lowCorner.x),
-                                fminf(a.lowCorner.y, b.lowCorner.y),
-                                fminf(a.lowCorner.z, b.lowCorner.z));
-        result.highCorner = Vec3(fmaxf(a.highCorner.x, b.highCorner.x),
-                                fmaxf(a.highCorner.y, b.highCorner.y),
-                                fmaxf(a.highCorner.z, b.highCorner.z));
-        return result;
     }
 };
 
@@ -135,12 +110,12 @@ __device__ inline unsigned gridLocation(float value, float low, float high) {
         ? unsigned(fminf(1023.f, fmaxf(0.f, (value - low) / (high - low) * 1024.f))) : 0;
 }
 
-__device__ unsigned long long mortonEncoding(int idx, const GPUTriangle triangle,
-                               unsigned long long* mortonCodes, NodeBox fullSpace) {
+__device__ unsigned long long mortonEncoding(int idx, const GPUTriangle& triangle,
+                                            const NodeBox& scene_bounds) {
     const Vec3 center = triangle.lowCorner * 0.5f + triangle.highCorner * 0.5f;
-    const unsigned x = gridLocation(center.x, fullSpace.lowCorner.x, fullSpace.highCorner.x);
-    const unsigned y = gridLocation(center.y, fullSpace.lowCorner.y, fullSpace.highCorner.y);
-    const unsigned z = gridLocation(center.z, fullSpace.lowCorner.z, fullSpace.highCorner.z);
+    const unsigned x = gridLocation(center.x, scene_bounds.lowCorner.x, scene_bounds.highCorner.x);
+    const unsigned y = gridLocation(center.y, scene_bounds.lowCorner.y, scene_bounds.highCorner.y);
+    const unsigned z = gridLocation(center.z, scene_bounds.lowCorner.z, scene_bounds.highCorner.z);
     unsigned long long morton = 0;
     for (int i = 0; i < 10; ++i) {
         morton |= static_cast<unsigned long long>((x >> i) & 1) << (3 * i + 2);
@@ -151,31 +126,14 @@ __device__ unsigned long long mortonEncoding(int idx, const GPUTriangle triangle
     return (morton << 32) | static_cast<unsigned long long>(idx);
 }
 
-
-struct GetLowCorner {
-    __host__ __device__
-    Vec3 operator()(const GPUTriangle& t) const {
-        return t.lowCorner;
+__device__ NodeBox calcNodeBox(const GPUTriangle* triangles, int start_index, int end_index) {
+    NodeBox box;
+    for (int i = start_index; i <= end_index; ++i) {
+        box.insert(triangles[i]);
     }
-};
-
-// 2) Binary op: component-wise min of two Vec3
-struct MinVec3 {
-    __host__ __device__
-    Vec3 operator()(const Vec3& a, const Vec3& b) const {
-        return Vec3(fminf(a.x, b.x),
-                    fminf(a.y, b.y),
-                    fminf(a.z, b.z));
-    }
-};
-
-
-void computerCorner(int* startIndex, int endIndex, GPUTriangle* triangles, Vec3* lowCorner, Vec3* highCorner) {
-    NodeBox box = thrust::reduce(triangles + startIndex, triangles + endIndex + 1, NodeBox(), NodeBox::operator+);
-    *lowCorner = box.lowCorner;
-    *highCorner = box.highCorner;
+    if (start_index <= end_index) box.pad();
+    return box;
 }
-
 
 // Calculate each node's inclusive sorted-triangle range directly from its index.
 // At depth d, node i spans capacity/2^d leaves starting at i-(2^d-1).
@@ -193,28 +151,59 @@ __global__ void buildBVHNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
     const long long stop = start + triangles_per_node;
     nodes[idx].startIndex = start < n_triangles ? static_cast<int>(start) : n_triangles;
     nodes[idx].endIndex = (stop < n_triangles ? static_cast<int>(stop) : n_triangles) - 1;
-    computerCorners(&nodes[idx].startIndex, &nodes[idx].endIndex + 1, &nodes[idx].lowCorner, &nodes[idx].highCorner);
 }
 
+__global__ void buildBVHLeafBounds(int leaf_capacity, const GPUTriangle* triangles,
+                                  LeafNode* nodes) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= leaf_capacity) return;
+    LeafNode& node = nodes[leaf_capacity - 1 + idx];
+    const NodeBox box = calcNodeBox(triangles, node.startIndex, node.endIndex);
+    node.lowCorner = box.lowCorner;
+    node.highCorner = box.highCorner;
+}
 
+__global__ void buildBVHInternalBounds(int level_start, int level_width, LeafNode* nodes) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= level_width) return;
+    const int node_index = level_start + idx;
+    NodeBox box;
+    for (int child_index = 2 * node_index + 1; child_index <= 2 * node_index + 2; ++child_index) {
+        const LeafNode& child = nodes[child_index];
+        if (child.startIndex <= child.endIndex) {
+            box.insert(child.lowCorner);
+            box.insert(child.highCorner);
+        }
+    }
+    nodes[node_index].lowCorner = box.lowCorner;
+    nodes[node_index].highCorner = box.highCorner;
+}
 
 // Call after Morton sorting. Same-stream kernel ordering supplies the barriers
 // between levels. No child pointers, temporary frontiers, or atomics are needed.
-void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
+void buildBVH(int n_nodes, int n_triangles, const GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes) {
     if (n_nodes == 0) return;
+    const int leaf_capacity = n_nodes / 2 + 1;
     buildBVHNodes<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         n_nodes, n_triangles, gpu_nodes);
-    buildBVHLeafBounds<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        n_nodes, gpu_triangles, gpu_nodes);
+    buildBVHLeafBounds<<<(leaf_capacity + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        leaf_capacity, gpu_triangles, gpu_nodes);
+    for (int width = leaf_capacity / 2; width > 0; width /= 2) {
+        buildBVHInternalBounds<<<(width + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            width - 1, width, gpu_nodes);
+    }
 }
 
-__global__ void convertToGPUTriagles(int n_triangles, unsigned long long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
+__global__ void convertToGPUTriangles(int n_triangles, unsigned long long* morton_codes,
+                                     const Triangle* triangles, GPUTriangle* gpu_triangles,
+                                     const int* object_indices, NodeBox scene_bounds) {
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= n_triangles) return;
     gpu_triangles[idx] = GPUTriangle(object_indices[idx], idx, triangles[idx]);
-    morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], morton_codes, fullSpace);
+    morton_codes[idx] = mortonEncoding(idx, gpu_triangles[idx], scene_bounds);
 }
+
 // Slab intersection, including rays parallel to a face of the box.
 __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closest, float& entry_distance) {
     if (node.endIndex < node.startIndex) return false;
@@ -240,8 +229,8 @@ __device__ bool intersectNode(const Ray& ray, const LeafNode& node, float closes
     entry_distance = near;
     return true;
 }
+
 __device__ bool intersect_triangle_gpu(const GPUTriangle& triangle, const Ray& ray, HitRecord* record) {
-    // Implementation for GPU triangle intersection
     const Vec3 p = cross(ray.direction, triangle.edge1);
     const float determinant = dot(triangle.edge0, p);
     if (std::fabs(determinant) <= EPSILON) {
@@ -273,6 +262,7 @@ __device__ bool intersect_triangle_gpu(const GPUTriangle& triangle, const Ray& r
     record->position = ray.origin + t * ray.direction;
     return true;
 }
+
 __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
                                 int previous_triangle, Hit& closest) {
     if (triangle.triangle_index == previous_triangle) return;
@@ -285,8 +275,6 @@ __device__ void testTriangleHit(const Ray& ray, const GPUTriangle& triangle,
         closest.triangle_index = triangle.triangle_index;
     }
 }
-
-
 
 __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                           const LeafNode* nodes, int n_nodes, int previous_triangle) {
@@ -324,8 +312,7 @@ __device__ Hit closestHit(const Ray& ray, const GPUTriangle* triangles,
                     pending_nodes[pending_count++] = left_is_nearer ? right_child : left_child;
                     node_index = left_is_nearer ? left_child : right_child;
                     continue;
-                }
-                else if (hit_left || hit_right) {
+                } else if (hit_left || hit_right) {
                     node_index = hit_left ? left_child : right_child;
                     continue;
                 }
@@ -416,7 +403,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     const size_t samples_per_output_pixel = size_t(subpixels_per_axis) * subpixels_per_axis
                                            * settings.samples_per_pixel;
     const size_t sample_count = output_pixel_count * samples_per_output_pixel;
-    // 1. Collect triangles and materials on CPU
+    // Collect triangles and materials on the CPU.
     std::vector<Triangle> triangles;
     std::vector<int> triangle_object_indices;
     std::vector<ObjectMaterial> materials(objects.size());
@@ -436,17 +423,15 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         }
     }
 
-    int triangle_count = static_cast<int>(triangles.size());
-    int bvh_node_count = countNodes(triangle_count);
-
-
-    // 2. Declare GPU pointers
+    const int triangle_count = static_cast<int>(triangles.size());
+    const int bvh_node_count = countNodes(triangle_count);
+    // Allocate GPU scene data.
     Triangle* gpu_raw_triangles = nullptr;
     GPUTriangle* gpu_triangles = nullptr;
     LeafNode* gpu_nodes = nullptr;
     ObjectMaterial* gpu_materials = nullptr;
     int* gpu_triangle_object_indices = nullptr;
-    unsigned long long* mortonCodes = nullptr;
+    unsigned long long* morton_codes = nullptr;
     Pixel* gpu_output_pixels = nullptr;
     Vec3* gpu_pixel_radiance_sums = nullptr;
     Vec3* gpu_sample_colors = nullptr;
@@ -457,7 +442,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
         cudaFree(gpu_triangles);
         cudaFree(gpu_materials);
         cudaFree(gpu_nodes);
-        cudaFree(mortonCodes);
+        cudaFree(morton_codes);
         cudaFree(gpu_output_pixels);
         cudaFree(gpu_pixel_radiance_sums);
         cudaFree(gpu_sample_colors);
@@ -468,93 +453,61 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     cudaMalloc(&gpu_triangles, triangle_count * sizeof(GPUTriangle));
     cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial));
     cudaMalloc(&gpu_nodes, bvh_node_count * sizeof(LeafNode));
-    cudaMalloc(&mortonCodes, triangle_count * sizeof(unsigned long long));
-        cudaMemcpy(
-            gpu_raw_triangles,
-            triangles.data(),
-            triangle_count * sizeof(Triangle),
-            cudaMemcpyHostToDevice
-        );
+    cudaMalloc(&morton_codes, triangle_count * sizeof(unsigned long long));
+    cudaMemcpy(gpu_raw_triangles, triangles.data(), triangle_count * sizeof(Triangle),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_triangle_object_indices, triangle_object_indices.data(),
+               triangle_count * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_materials, materials.data(), objects.size() * sizeof(ObjectMaterial),
+               cudaMemcpyHostToDevice);
 
-        cudaMemcpy(
-            gpu_triangle_object_indices,
-            triangle_object_indices.data(),
-            triangle_count * sizeof(int),
-            cudaMemcpyHostToDevice
-        );
+    // Convert triangles and compute Morton keys.
+    if (triangle_count > 0) {
+        convertToGPUTriangles<<<(triangle_count + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            triangle_count, morton_codes, gpu_raw_triangles, gpu_triangles,
+            gpu_triangle_object_indices, scene_bounds);
+    }
 
-        cudaMemcpy(
-            gpu_materials,
-            materials.data(),
-            objects.size() * sizeof(ObjectMaterial),
-            cudaMemcpyHostToDevice
-        );
+    // Free temporary input arrays.
+    cudaFree(gpu_raw_triangles);
+    gpu_raw_triangles = nullptr;
+    cudaFree(gpu_triangle_object_indices);
+    gpu_triangle_object_indices = nullptr;
 
+    // Sort triangles directly by Morton keys.
+    if (triangle_count > 0) {
+        thrust::sort_by_key(thrust::device, morton_codes, morton_codes + triangle_count,
+                            gpu_triangles);
+    }
+    cudaFree(morton_codes);
+    morton_codes = nullptr;
 
-        // 5. Convert triangles into GPU triangle structures
-        convertToGPUTriagles<<<
-            (triangle_count + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE
-        >>>(
-            triangle_count,
-            mortonCodes,
-            gpu_raw_triangles,
-            gpu_triangles,
-            gpu_triangle_object_indices,
-            scene_bounds
-        );
+    // Build fixed leaves and merge adjacent nodes in parallel rounds.
+    buildBVH(bvh_node_count, triangle_count, gpu_triangles, gpu_nodes);
 
-
-        // 6. Free temporary GPU arrays
-   
-        cudaFree(gpu_raw_triangles);
-        gpu_raw_triangles = nullptr;
-        cudaFree(gpu_triangle_object_indices);
-        gpu_triangle_object_indices = nullptr;
-
-
-        // 9. Sort triangles directly by Morton keys.
-        thrust::sort_by_key(
-            thrust::device,
-            mortonCodes,
-            mortonCodes + triangle_count,
-            gpu_triangles
-        );
-
-
-        cudaFree(mortonCodes);
-        mortonCodes = nullptr;
-        // 10. Build fixed leaves and merge adjacent nodes in parallel rounds.
-        buildBVH(
-            bvh_node_count,
-            triangle_count,
-            gpu_triangles,
-            gpu_nodes
-        );
-
-        // 11. Trace every branch, sum by output pixel, and average once.
-        cudaMalloc(&gpu_output_pixels, output_pixel_count * sizeof(Pixel));
-        cudaMalloc(&gpu_pixel_radiance_sums, output_pixel_count * sizeof(Vec3));
-        cudaMalloc(&gpu_sample_colors, sample_count * sizeof(Vec3));
-        cudaMalloc(&gpu_subpixel_first_hits, subpixel_count * sizeof(Hit));
-        const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
-        findSubpixelFirstHits<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits, subpixel_count, subpixel_grid_width);
-        tracePixelSamples<<<unsigned((sample_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_materials,
-            gpu_subpixel_first_hits, gpu_sample_colors, sample_count);
-        const auto sample_indices = thrust::make_counting_iterator<size_t>(0);
-        const auto pixel_keys = thrust::make_transform_iterator(
-            sample_indices, ColorGroupIndex{samples_per_output_pixel});
-        thrust::reduce_by_key(thrust::device, pixel_keys, pixel_keys + sample_count,
-                              gpu_sample_colors, thrust::make_discard_iterator(), gpu_pixel_radiance_sums,
-                              thrust::equal_to<size_t>(), thrust::plus<Vec3>());
-        cudaFree(gpu_sample_colors);
-        gpu_sample_colors = nullptr;
-        finalizeOutputPixels<<<unsigned((output_pixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
-            settings, gpu_pixel_radiance_sums, gpu_output_pixels, output_pixel_count);
-        std::vector<Pixel> output_pixels(output_pixel_count);
-        cudaMemcpy(output_pixels.data(), gpu_output_pixels, output_pixel_count * sizeof(Pixel), cudaMemcpyDeviceToHost);
-        release();
-        return output_pixels;
+    // Trace every branch, sum by output pixel, and average once.
+    cudaMalloc(&gpu_output_pixels, output_pixel_count * sizeof(Pixel));
+    cudaMalloc(&gpu_pixel_radiance_sums, output_pixel_count * sizeof(Vec3));
+    cudaMalloc(&gpu_sample_colors, sample_count * sizeof(Vec3));
+    cudaMalloc(&gpu_subpixel_first_hits, subpixel_count * sizeof(Hit));
+    const size_t subpixel_grid_width = size_t(settings.width) * settings.supersampling_factor;
+    findSubpixelFirstHits<<<unsigned((subpixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+        settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_subpixel_first_hits, subpixel_count, subpixel_grid_width);
+    tracePixelSamples<<<unsigned((sample_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+        settings, gpu_triangles, gpu_nodes, bvh_node_count, gpu_materials,
+        gpu_subpixel_first_hits, gpu_sample_colors, sample_count);
+    const auto sample_indices = thrust::make_counting_iterator<size_t>(0);
+    const auto pixel_keys = thrust::make_transform_iterator(
+        sample_indices, ColorGroupIndex{samples_per_output_pixel});
+    thrust::reduce_by_key(thrust::device, pixel_keys, pixel_keys + sample_count,
+                          gpu_sample_colors, thrust::make_discard_iterator(), gpu_pixel_radiance_sums,
+                          thrust::equal_to<size_t>(), thrust::plus<Vec3>());
+    cudaFree(gpu_sample_colors);
+    gpu_sample_colors = nullptr;
+    finalizeOutputPixels<<<unsigned((output_pixel_count + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE>>>(
+        settings, gpu_pixel_radiance_sums, gpu_output_pixels, output_pixel_count);
+    std::vector<Pixel> output_pixels(output_pixel_count);
+    cudaMemcpy(output_pixels.data(), gpu_output_pixels, output_pixel_count * sizeof(Pixel), cudaMemcpyDeviceToHost);
+    release();
+    return output_pixels;
 }
