@@ -15,6 +15,7 @@
 
 constexpr int MAX_LEAF_SIZE = 2;
 constexpr int BLOCK_SIZE = 256;
+
 using namespace std;
 struct Hit {
     HitRecord record;
@@ -80,7 +81,18 @@ struct NodeBox {
         insert(triangle.p0); insert(triangle.p1); insert(triangle.p2);
     }
     __host__ __device__  inline void insert(const NodeBox& other) {
-        insert(other.lowCorner); insert(other.highCorner);
+        updateLowHigh(other);
+    }
+    __host__ __device__  inline void insert(const GPUTriangle& triangle) {
+        updateLowHigh(NodeBox(triangle));
+    }
+    __host__ __device__ void updateLowHigh(const NodeBox& other) {
+        lowCorner = Vec3(fminf(lowCorner.x, other.lowCorner.x),
+                         fminf(lowCorner.y, other.lowCorner.y),
+                         fminf(lowCorner.z, other.lowCorner.z));
+        highCorner = Vec3(fmaxf(highCorner.x, other.highCorner.x),
+                          fmaxf(highCorner.y, other.highCorner.y),
+                          fmaxf(highCorner.z, other.highCorner.z));
     }
     __device__ void pad() {
         const float scale = 8.0f * 1.1920928955078125e-7f;
@@ -90,8 +102,25 @@ struct NodeBox {
         lowCorner -= padding;
         highCorner += padding;
     }
+    __device__ NodeBox (Vec3 low, Vec3 high): lowCorner(low), highCorner(high) {}
+    __host__ __device__ NodeBox (GPUTriangle triangle): lowCorner(triangle.lowCorner), highCorner(triangle.highCorner) {}
+    __host__ __device__ NodeBox() (GPUTriangle triangle1, GPUTriangle triangle2){
+        NodeBox box1(triangle1);
+        box1.insert(triangle2);
+        lowCorner = box1.lowCorner;
+        highCorner = box1.highCorner;
+    }
 };
-
+__host__device__ inline NodeBox operator+(const NodeBox& a, const NodeBox& b) {
+    NodeBox result;
+    result.lowCorner = Vec3(fminf(a.lowCorner.x, b.lowCorner.x),
+                            fminf(a.lowCorner.y, b.lowCorner.y),
+                            fminf(a.lowCorner.z, b.lowCorner.z));
+    result.highCorner = Vec3(fmaxf(a.highCorner.x, b.highCorner.x),
+                             fmaxf(a.highCorner.y, b.highCorner.y),
+                             fmaxf(a.highCorner.z, b.highCorner.z));
+    return result;
+}
 __host__ __device__ inline int countNodes(int n) {
     if (n == 0) return 0;
     const int leaves = n / MAX_LEAF_SIZE + (n % MAX_LEAF_SIZE != 0);
@@ -121,16 +150,73 @@ __device__ unsigned long long mortonEncoding(int idx, const GPUTriangle triangle
     return (morton << 32) | static_cast<unsigned long long>(idx);
 }
 
-__device__ NodeBox calcNodeBox(const GPUTriangle* triangles, const int startIndex, const int endIndex) {
-    NodeBox box;
-    for (int i = startIndex; i <= endIndex; ++i) {
-        box.insert(triangles[i].lowCorner);
-        box.insert(triangles[i].highCorner);
+
+struct GetLowCorner {
+    __host__ __device__
+    Vec3 operator()(const GPUTriangle& t) const {
+        return t.lowCorner;
     }
+};
+
+// 2) Binary op: component-wise min of two Vec3
+struct MinVec3 {
+    __host__ __device__
+    Vec3 operator()(const Vec3& a, const Vec3& b) const {
+        return Vec3(fminf(a.x, b.x),
+                    fminf(a.y, b.y),
+                    fminf(a.z, b.z));
+    }
+};
+
+Vec3 computeLowCorner(const GPUTriangle* triangle1, const GPUTriangle* triangle2)
+{
+    // Identity element for min: +infinity (FLT_MAX)
+    Vec3 init(FLT_MAX, FLT_MAX, FLT_MAX);
+    return thrust::transform_reduce(
+        triangle1, triangle2,
+        GetLowCorner(),   // transform
+        init,             // initial value
+        MinVec3());       // reduction
+}
+struct GetHighCorner {
+    __host__ __device__
+    Vec3 operator()(const GPUTriangle& t) const {
+        return t.highCorner;
+    }
+};
+
+// Component-wise max of two Vec3
+struct MaxVec3 {
+    __host__ __device__
+    Vec3 operator()(const Vec3& a, const Vec3& b) const {
+        return Vec3(fmaxf(a.x, b.x),
+                    fmaxf(a.y, b.y),
+                    fmaxf(a.z, b.z));
+    }
+};
+
+Vec3 computeHighCorner(const GPUTriangle* triangle1, const GPUTriangle* triangle2)
+{
+    return thrust::transform_reduce(
+        triangle1, triangle2,
+        GetHighCorner(),   // transform
+        Vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX),             // initial value
+        MaxVec3());       // reduction
+}
+
+
+NodeBox computeNodeBox(const GPUTriangle* triangles, int startIndex, int endIndex) {
+    Vec3 lowCorner = computeLowCorner(triangles + startIndex, triangles + endIndex + 1);
+    Vec3 highCorner = computeHighCorner(triangles + startIndex, triangles + endIndex + 1);
+    NodeBox box(lowCorner, highCorner);
     box.pad();
     return box;
 }
-
+void computerCorner(int* startIndex, int endIndex, GPUTriangle* triangles, Vec3* lowCorner, Vec3* highCorner) {
+    NodeBox box = thrust::reduce(triangles + startIndex, triangles + endIndex + 1, NodeBox(), NodeBox::operator+);
+    *lowCorner = box.lowCorner;
+    *highCorner = box.highCorner;
+}
 
 
 // Calculate each node's inclusive sorted-triangle range directly from its index.
@@ -149,56 +235,20 @@ __global__ void buildBVHNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
     const long long stop = start + triangles_per_node;
     nodes[idx].startIndex = start < n_triangles ? static_cast<int>(start) : n_triangles;
     nodes[idx].endIndex = (stop < n_triangles ? static_cast<int>(stop) : n_triangles) - 1;
+    computerCorners(&nodes[idx].startIndex, &nodes[idx].endIndex + 1, &nodes[idx].lowCorner, &nodes[idx].highCorner);
 }
 
-// Leaf i owns sorted positions [2*i, 2*i+1], with a possible singleton last leaf.
-__global__ void buildBVHLeafBounds(int leaf_capacity, const GPUTriangle* triangles,
-                                  LeafNode* nodes) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= leaf_capacity) return;
-    LeafNode& leaf = nodes[leaf_capacity - 1 + idx];
-    NodeBox box;
-    if (leaf.startIndex <= leaf.endIndex)
-        box = calcNodeBox(triangles, leaf.startIndex, leaf.endIndex);
-    leaf.lowCorner = box.lowCorner;
-    leaf.highCorner = box.highCorner;
-}
 
-// One thread per parent at this level. Both children were built by the prior launch.
-__global__ void buildBVHInternalBounds(int first_parent, int parent_count, LeafNode* nodes) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= parent_count) return;
-    const int parent_index = first_parent + idx;
-    const LeafNode& left = nodes[2 * parent_index + 1];
-    const LeafNode& right = nodes[2 * parent_index + 2];
-    LeafNode& parent = nodes[parent_index];
-    NodeBox box;
-    if (left.startIndex <= left.endIndex) {
-        box.insert(left.lowCorner);
-        box.insert(left.highCorner);
-    }
-    if (right.startIndex <= right.endIndex) {
-        box.insert(right.lowCorner);
-        box.insert(right.highCorner);
-    }
-    parent.lowCorner = box.lowCorner;
-    parent.highCorner = box.highCorner;
-}
 
 // Call after Morton sorting. Same-stream kernel ordering supplies the barriers
 // between levels. No child pointers, temporary frontiers, or atomics are needed.
 void buildBVH(int n_nodes, int n_triangles, GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes) {
     if (n_nodes == 0) return;
-    const int leaf_capacity = n_nodes / 2 + 1;
     buildBVHNodes<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         n_nodes, n_triangles, gpu_nodes);
-    buildBVHLeafBounds<<<(leaf_capacity + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        leaf_capacity, gpu_triangles, gpu_nodes);
-    for (int parent_count = leaf_capacity / 2; parent_count > 0; parent_count /= 2) {
-        buildBVHInternalBounds<<<(parent_count + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-            parent_count - 1, parent_count, gpu_nodes);
-    }
+    buildBVHLeafBounds<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        n_nodes, gpu_triangles, gpu_nodes);
 }
 
 __global__ void convertToGPUTriagles(int n_triangles, unsigned long long* morton_codes, const Triangle* triangles, GPUTriangle* gpu_triangles, int* object_indices, NodeBox fullSpace) {
@@ -413,7 +463,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     std::vector<int> triangle_object_indices;
     std::vector<ObjectMaterial> materials(objects.size());
     NodeBox scene_bounds;
-
     for (int object_index = 0; object_index < objects.size(); ++object_index) {
         const Object& object = objects[object_index];
 
@@ -462,8 +511,6 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     cudaMalloc(&gpu_materials, objects.size() * sizeof(ObjectMaterial));
     cudaMalloc(&gpu_nodes, bvh_node_count * sizeof(LeafNode));
     cudaMalloc(&mortonCodes, triangle_count * sizeof(unsigned long long));
-
-
         cudaMemcpy(
             gpu_raw_triangles,
             triangles.data(),
