@@ -1,4 +1,7 @@
-"""Exercise the production BVH kernels on the host without a CUDA toolkit.
+"""Exercise BVH ranges and reduction functors without a CUDA toolkit.
+
+The host harness substitutes std::transform_reduce for the device Thrust call;
+it does not verify Thrust/CUDA compilation or GPU execution.
 
 Run with: python3 -m unittest discover -s tests -v
 """
@@ -26,8 +29,13 @@ class BVHTopologyTest(unittest.TestCase):
         node = source[source.index("struct LeafNode {"):source.index("struct GPUTriangle")]
         box_and_count = source[source.index("struct NodeBox {"):source.index(
             "__device__ inline unsigned gridLocation")]
-        kernels = source[source.index("__device__ NodeBox calcNodeBox"):source.index(
+        kernels = source[source.index("struct TriangleBounds"):source.index(
             "// Call after Morton sorting.")]
+        # Keep the production functors and kernel; adapt only the library call.
+        kernels = kernels.replace(
+            "thrust::transform_reduce(\n        thrust::seq,",
+            "hostTransformReduce(",
+        )
         program = r"""
 #include <algorithm>
 #include <cassert>
@@ -35,6 +43,7 @@ class BVHTopologyTest(unittest.TestCase):
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <vector>
 #define __host__
@@ -47,7 +56,12 @@ struct LaunchIndex { int x = 0; } blockIdx, threadIdx, blockDim{32};
 """ + vec + r"""
 struct Triangle { Vec3 p0, p1, p2; };
 struct GPUTriangle { Vec3 lowCorner, highCorner; int triangle_index, object_index; };
-""" + node + box_and_count + kernels + r"""
+""" + node + box_and_count + r"""
+template<class Iterator, class Unary, class T, class Binary>
+T hostTransformReduce(Iterator first, Iterator last, Unary unary, T init, Binary binary) {
+    return std::transform_reduce(first, last, init, binary, unary);
+}
+""" + kernels + r"""
 bool equal(const Vec3& a, const Vec3& b) {
     return a.x == b.x && a.y == b.y && a.z == b.z;
 }
@@ -84,38 +98,24 @@ int main() {
                 kernel();
             }
         };
-        // Topology must be complete before bounds, and must leave boxes alone.
+        // Every node computes its bounds independently of launch order.
         for (auto& node : nodes) {
             node.lowCorner = Vec3(123, 456, 789);
             node.highCorner = Vec3(-123, -456, -789);
         }
-        launch(node_count, [&] { buildBVHNodes(node_count, n, nodes.data()); });
+        launch(node_count, [&] { buildBVHNodes(node_count, n, triangles.data(), nodes.data()); });
         std::function<void(int, int, int)> check_ranges = [&](int index, int start, int slots) {
             const auto& node = nodes[index];
             assert(node.startIndex == std::min(start * 2, n));
             assert(node.endIndex == std::min((start + slots) * 2, n) - 1);
-            assert(equal(node.lowCorner, Vec3(123, 456, 789)));
-            assert(equal(node.highCorner, Vec3(-123, -456, -789)));
             if (slots > 1) {
                 check_ranges(2 * index + 1, start, slots / 2);
                 check_ranges(2 * index + 2, start + slots / 2, slots / 2);
             }
         };
         check_ranges(0, 0, capacity);
-        const auto topology = nodes;
-        launch(capacity, [&] {
-            buildBVHLeafBounds(capacity, triangles.data(), nodes.data());
-        });
-        int rounds = 0;
-        for (int width = capacity / 2; width > 0; width /= 2) {
-            launch(width, [&] {
-                buildBVHInternalBounds(width - 1, width, nodes.data());
-            });
-            ++rounds;
-        }
         int expected_rounds = 0;
         for (int width = 1; width < leaves; width *= 2) ++expected_rounds;
-        assert(rounds == expected_rounds);
         std::vector<int> visited(node_count, 0), covered(n, 0);
         int leaf_visits = 0;
         std::function<int(int, int)> check = [&](int index, int depth) {
@@ -124,17 +124,30 @@ int main() {
             const auto& node = nodes[index];
             const int count = node.endIndex - node.startIndex + 1;
             assert(count >= 0);
-            assert(node.startIndex == topology[index].startIndex);
-            assert(node.endIndex == topology[index].endIndex);
+            // Independent reference: scan coordinates directly, without the
+            // production TriangleBounds/MergeBounds functors.
+            NodeBox expected;
+            for (int i = node.startIndex; i <= node.endIndex; ++i) {
+                const auto& triangle = triangles[i];
+                expected.lowCorner = Vec3(std::min(expected.lowCorner.x, triangle.lowCorner.x),
+                                          std::min(expected.lowCorner.y, triangle.lowCorner.y),
+                                          std::min(expected.lowCorner.z, triangle.lowCorner.z));
+                expected.highCorner = Vec3(std::max(expected.highCorner.x, triangle.highCorner.x),
+                                           std::max(expected.highCorner.y, triangle.highCorner.y),
+                                           std::max(expected.highCorner.z, triangle.highCorner.z));
+            }
+            if (count > 0) expected.pad();
+            assert(equal(node.lowCorner, expected.lowCorner));
+            assert(equal(node.highCorner, expected.highCorner));
+            for (int i = node.startIndex; i <= node.endIndex; ++i) {
+                contains(node, triangles[i].lowCorner);
+                contains(node, triangles[i].highCorner);
+            }
             if (index >= capacity - 1) {
                 const int sorted_start = 2 * (index - capacity + 1);
                 assert(node.startIndex == std::min(sorted_start, n));
                 assert(count == std::max(0, std::min(2, n - sorted_start)));
                 if (count > 0) ++leaf_visits;
-                NodeBox expected;
-                if (count > 0) expected = calcNodeBox(triangles.data(), node.startIndex, node.endIndex);
-                assert(equal(node.lowCorner, expected.lowCorner));
-                assert(equal(node.highCorner, expected.highCorner));
                 for (int i = node.startIndex; i <= node.endIndex; ++i) {
                     ++covered[i];
                     contains(node, triangles[i].lowCorner);
@@ -151,15 +164,6 @@ int main() {
             assert(node.endIndex == right.endIndex);
             assert(count == left.endIndex - left.startIndex + 1
                             + right.endIndex - right.startIndex + 1);
-            NodeBox expected;
-            if (left.startIndex <= left.endIndex) {
-                expected.insert(left.lowCorner); expected.insert(left.highCorner);
-            }
-            if (right.startIndex <= right.endIndex) {
-                expected.insert(right.lowCorner); expected.insert(right.highCorner);
-            }
-            assert(equal(node.lowCorner, expected.lowCorner));
-            assert(equal(node.highCorner, expected.highCorner));
             return std::max(check(left_index, depth + 1),
                             check(right_index, depth + 1));
         };

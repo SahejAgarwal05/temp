@@ -7,6 +7,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
+#include <thrust/transform_reduce.h>
 
 constexpr int MAX_LEAF_SIZE = 2;
 constexpr int BLOCK_SIZE = 256;
@@ -83,8 +84,12 @@ struct NodeBox {
     }
 
     __host__ __device__ void insert(const GPUTriangle& triangle) {
-        insert(triangle.lowCorner);
-        insert(triangle.highCorner);
+        lowCorner = Vec3(fminf(lowCorner.x, triangle.lowCorner.x),
+                         fminf(lowCorner.y, triangle.lowCorner.y),
+                         fminf(lowCorner.z, triangle.lowCorner.z));
+        highCorner = Vec3(fmaxf(highCorner.x, triangle.highCorner.x),
+                          fmaxf(highCorner.y, triangle.highCorner.y),
+                          fmaxf(highCorner.z, triangle.highCorner.z));
     }
 
     __device__ void pad() {
@@ -126,19 +131,43 @@ __device__ unsigned long long mortonEncoding(int idx, const GPUTriangle& triangl
     return (morton << 32) | static_cast<unsigned long long>(idx);
 }
 
-__device__ NodeBox calcNodeBox(const GPUTriangle* triangles, int start_index, int end_index) {
-    NodeBox box;
-    for (int i = start_index; i <= end_index; ++i) {
-        box.insert(triangles[i]);
+struct TriangleBounds {
+    __host__ __device__ NodeBox operator()(const GPUTriangle& triangle) const {
+        NodeBox box;
+        box.insert(triangle);
+        return box;
     }
-    if (start_index <= end_index) box.pad();
+};
+
+struct MergeBounds {
+    __host__ __device__ NodeBox operator()(const NodeBox& a, const NodeBox& b) const {
+        NodeBox box;
+        box.lowCorner = Vec3(fminf(a.lowCorner.x, b.lowCorner.x),
+                             fminf(a.lowCorner.y, b.lowCorner.y),
+                             fminf(a.lowCorner.z, b.lowCorner.z));
+        box.highCorner = Vec3(fmaxf(a.highCorner.x, b.highCorner.x),
+                              fmaxf(a.highCorner.y, b.highCorner.y),
+                              fmaxf(a.highCorner.z, b.highCorner.z));
+        return box;
+    }
+};
+
+__device__ NodeBox calcNodeBox(const GPUTriangle* triangles, int start_index, int end_index) {
+    if (start_index > end_index) return NodeBox{};
+    // Each GPU thread reduces its node's range. Explicit seq keeps the Thrust
+    // call on that thread; no nested kernel launches or -rdc=true are required.
+    NodeBox box = thrust::transform_reduce(
+        thrust::seq, triangles + start_index, triangles + end_index + 1,
+        TriangleBounds{}, NodeBox{}, MergeBounds{});
+    box.pad();
     return box;
 }
 
 // Calculate each node's inclusive sorted-triangle range directly from its index.
 // At depth d, node i spans capacity/2^d leaves starting at i-(2^d-1).
-// No recursion, tree walk, child reads, or bounding-box work.
-__global__ void buildBVHNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
+// Each node independently reduces its own range to compute its bounds.
+__global__ void buildBVHNodes(int n_nodes, int n_triangles, const GPUTriangle* triangles,
+                              LeafNode* nodes) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_nodes) return;
     const int leaf_capacity = n_nodes / 2 + 1;
@@ -151,48 +180,18 @@ __global__ void buildBVHNodes(int n_nodes, int n_triangles, LeafNode* nodes) {
     const long long stop = start + triangles_per_node;
     nodes[idx].startIndex = start < n_triangles ? static_cast<int>(start) : n_triangles;
     nodes[idx].endIndex = (stop < n_triangles ? static_cast<int>(stop) : n_triangles) - 1;
+    const NodeBox box = calcNodeBox(triangles, nodes[idx].startIndex, nodes[idx].endIndex);
+    nodes[idx].lowCorner = box.lowCorner;
+    nodes[idx].highCorner = box.highCorner;
 }
 
-__global__ void buildBVHLeafBounds(int leaf_capacity, const GPUTriangle* triangles,
-                                  LeafNode* nodes) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= leaf_capacity) return;
-    LeafNode& node = nodes[leaf_capacity - 1 + idx];
-    const NodeBox box = calcNodeBox(triangles, node.startIndex, node.endIndex);
-    node.lowCorner = box.lowCorner;
-    node.highCorner = box.highCorner;
-}
-
-__global__ void buildBVHInternalBounds(int level_start, int level_width, LeafNode* nodes) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= level_width) return;
-    const int node_index = level_start + idx;
-    NodeBox box;
-    for (int child_index = 2 * node_index + 1; child_index <= 2 * node_index + 2; ++child_index) {
-        const LeafNode& child = nodes[child_index];
-        if (child.startIndex <= child.endIndex) {
-            box.insert(child.lowCorner);
-            box.insert(child.highCorner);
-        }
-    }
-    nodes[node_index].lowCorner = box.lowCorner;
-    nodes[node_index].highCorner = box.highCorner;
-}
-
-// Call after Morton sorting. Same-stream kernel ordering supplies the barriers
-// between levels. No child pointers, temporary frontiers, or atomics are needed.
+// Call after Morton sorting. All nodes compute their ranges and bounds in one
+// launch, without reading child nodes or waiting for level-by-level merges.
 void buildBVH(int n_nodes, int n_triangles, const GPUTriangle* gpu_triangles,
               LeafNode* gpu_nodes) {
     if (n_nodes == 0) return;
-    const int leaf_capacity = n_nodes / 2 + 1;
     buildBVHNodes<<<(n_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        n_nodes, n_triangles, gpu_nodes);
-    buildBVHLeafBounds<<<(leaf_capacity + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        leaf_capacity, gpu_triangles, gpu_nodes);
-    for (int width = leaf_capacity / 2; width > 0; width /= 2) {
-        buildBVHInternalBounds<<<(width + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-            width - 1, width, gpu_nodes);
-    }
+        n_nodes, n_triangles, gpu_triangles, gpu_nodes);
 }
 
 __global__ void convertToGPUTriangles(int n_triangles, unsigned long long* morton_codes,
@@ -482,7 +481,7 @@ std::vector<Pixel> render_scene(const RenderSettings& settings, const std::vecto
     cudaFree(morton_codes);
     morton_codes = nullptr;
 
-    // Build fixed leaves and merge adjacent nodes in parallel rounds.
+    // Compute every node's range and Thrust-reduced bounds independently.
     buildBVH(bvh_node_count, triangle_count, gpu_triangles, gpu_nodes);
 
     // Trace every branch, sum by output pixel, and average once.
