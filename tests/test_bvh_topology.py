@@ -27,7 +27,7 @@ class BVHTopologyTest(unittest.TestCase):
         box_and_count = source[source.index("struct NodeBox {"):source.index(
             "__device__ inline unsigned gridLocation")]
         kernels = source[source.index("__device__ NodeBox calcNodeBox"):source.index(
-            "// Call after Morton sorting.")]
+            "void buildBVH(")]
         program = r"""
 #include <algorithm>
 #include <cassert>
